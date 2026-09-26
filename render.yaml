@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: option-bands
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: MASSIVE_API_KEY
+        sync: false
