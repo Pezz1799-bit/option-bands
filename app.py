@@ -1,185 +1,147 @@
 
-import os, math, time, json
+import os, math, time
 from datetime import date, timedelta, datetime
 from flask import Flask, render_template, request, jsonify
 import requests
 
-app = Flask(__name__)
-BASE = "https://api.massive.com"
-API_KEY = os.getenv("MASSIVE_API_KEY", "").strip()
-MIN_CAP = 1_000_000_000
-ALLOWED_EXCHANGES = {"XNAS", "XNYS"}  # Nasdaq, NYSE MICs
+app=Flask(__name__)
+BASE="https://api.massive.com"
+API_KEY=os.getenv("MASSIVE_API_KEY","").strip()
+MIN_CAP=1_000_000_000
+ALLOWED_EXCHANGES={"XNAS","XNYS"}
+RISK_FREE=0.04
+CACHE={}
+CACHE_TTL=3600
 
-def api(path, params=None):
-    if not API_KEY:
-        raise RuntimeError("MASSIVE_API_KEY non configurata sul server.")
-    p = dict(params or {})
-    p["apiKey"] = API_KEY
-    r = requests.get(BASE + path, params=p, timeout=30)
-    if r.status_code == 403:
-        raise RuntimeError("Il tuo piano Massive non include questo endpoint.")
-    if r.status_code == 429:
-        raise RuntimeError("Limite API Massive raggiunto. Riprova tra poco.")
-    r.raise_for_status()
-    return r.json()
+def cached(key, fn):
+    now=time.time()
+    if key in CACHE and now-CACHE[key][0] < CACHE_TTL: return CACHE[key][1]
+    v=fn(); CACHE[key]=(now,v); return v
 
-def ticker_details(ticker):
-    return api(f"/v3/reference/tickers/{ticker.upper()}").get("results", {})
+def api(path,params=None):
+    if not API_KEY: raise RuntimeError("MASSIVE_API_KEY non configurata.")
+    p=dict(params or {}); p["apiKey"]=API_KEY
+    r=requests.get(BASE+path,params=p,timeout=30)
+    if r.status_code==429: raise RuntimeError("Limite gratuito Massive: 5 chiamate/minuto. Attendi circa un minuto.")
+    if r.status_code==403: raise RuntimeError("Questo endpoint non è incluso nel piano Massive Basic.")
+    r.raise_for_status(); return r.json()
+
+def details(t):
+    return cached(("det",t),lambda:api(f"/v3/reference/tickers/{t}").get("results",{}))
 
 def eligible(d):
-    return (
-        d.get("active", True)
-        and d.get("market") == "stocks"
-        and d.get("primary_exchange") in ALLOWED_EXCHANGES
-        and (d.get("market_cap") or 0) >= MIN_CAP
-    )
+    return d.get("market")=="stocks" and d.get("primary_exchange") in ALLOWED_EXCHANGES and (d.get("market_cap") or 0)>=MIN_CAP
 
-def aggs(ticker, days=365):
-    end = date.today()
-    start = end - timedelta(days=days)
-    data = api(f"/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}",
-               {"adjusted":"true","sort":"asc","limit":5000})
-    return data.get("results", [])
+def bars(t,days=365):
+    def load():
+        e=date.today(); s=e-timedelta(days=days)
+        return api(f"/v2/aggs/ticker/{t}/range/1/day/{s}/{e}",{"adjusted":"true","sort":"asc","limit":5000}).get("results",[])
+    return cached(("bars",t,days),load)
 
-def all_chain(ticker):
-    # Follow Massive pagination while preserving auth.
-    url = f"{BASE}/v3/snapshot/options/{ticker}"
-    params = {"limit":250, "apiKey":API_KEY}
-    out = []
-    for _ in range(20):
-        r = requests.get(url, params=params, timeout=30)
-        if r.status_code == 403:
-            raise RuntimeError("Il piano Massive attuale non include Option Chain Snapshot.")
-        if r.status_code == 429:
-            raise RuntimeError("Limite API Massive raggiunto.")
-        r.raise_for_status()
-        j = r.json()
-        out.extend(j.get("results", []))
-        nxt = j.get("next_url")
-        if not nxt: break
-        url = nxt
-        params = {"apiKey":API_KEY}
-    return out
+def contracts(t):
+    # One reference request. Limit 1000 is normally enough for near expiries;
+    # UI uses expiries present in this first page to keep Basic API usage low.
+    def load():
+        j=api("/v3/reference/options/contracts",{"underlying_ticker":t,"expired":"false","limit":1000,"sort":"expiration_date","order":"asc"})
+        return j.get("results",[])
+    return cached(("contracts",t),load)
 
-def expirations(chain):
-    vals = set()
-    for x in chain:
-        e = (x.get("details") or {}).get("expiration_date")
-        if e: vals.add(e)
-    return sorted(vals)
+def option_prev(opticker):
+    def load():
+        j=api(f"/v2/aggs/ticker/{opticker}/prev",{"adjusted":"true"})
+        a=j.get("results",[])
+        return a[0] if a else None
+    return cached(("oprev",opticker),load)
 
-def pick_delta(chain, expiration, contract_type, target_abs=.25):
-    candidates = []
-    for x in chain:
-        d = x.get("details") or {}
-        if d.get("expiration_date") != expiration or d.get("contract_type") != contract_type:
-            continue
-        iv = x.get("implied_volatility")
-        delta = (x.get("greeks") or {}).get("delta")
-        if iv is None or delta is None: continue
-        candidates.append((abs(abs(delta)-target_abs), x))
-    return min(candidates, key=lambda z:z[0])[1] if candidates else None
+def norm_cdf(x): return 0.5*(1+math.erf(x/math.sqrt(2)))
 
-def pick_atm(chain, expiration, spot):
-    candidates=[]
-    for x in chain:
-        d=x.get("details") or {}
-        if d.get("expiration_date") != expiration: continue
-        iv=x.get("implied_volatility"); k=d.get("strike_price")
-        if iv is None or k is None: continue
-        candidates.append((abs(k-spot),x))
-    return min(candidates,key=lambda z:z[0])[1] if candidates else None
+def bs_price(S,K,T,r,sigma,is_call):
+    if T<=0 or sigma<=0: return max(0,S-K) if is_call else max(0,K-S)
+    d1=(math.log(S/K)+(r+0.5*sigma*sigma)*T)/(sigma*math.sqrt(T)); d2=d1-sigma*math.sqrt(T)
+    if is_call: return S*norm_cdf(d1)-K*math.exp(-r*T)*norm_cdf(d2)
+    return K*math.exp(-r*T)*norm_cdf(-d2)-S*norm_cdf(-d1)
 
-def option_metrics(chain, expiration):
-    rows=[x for x in chain if (x.get("details") or {}).get("expiration_date")==expiration]
-    if not rows: raise RuntimeError("Nessun contratto per questa scadenza.")
-    spot=None
-    for x in rows:
-        spot=(x.get("underlying_asset") or {}).get("price")
-        if spot: break
-    if not spot:
-        raise RuntimeError("Prezzo sottostante non disponibile nello snapshot.")
-    put=pick_delta(rows, expiration, "put")
-    call=pick_delta(rows, expiration, "call")
-    atm=pick_atm(rows, expiration, spot)
-    if not put or not call or not atm:
-        raise RuntimeError("IV/Greeks insufficienti per calcolare le bande.")
-    piv=float(put["implied_volatility"]); civ=float(call["implied_volatility"])
-    aiv=float(atm["implied_volatility"])
-    exp=datetime.strptime(expiration,"%Y-%m-%d").date()
-    dte=max((exp-date.today()).days,1)
-    down=piv*math.sqrt(dte/365)
-    up=civ*math.sqrt(dte/365)
-    # Lognormal-style multiplicative levels; asymmetric by IV wing.
-    bands={
-        "lower2": spot*math.exp(-2*down), "lower1": spot*math.exp(-down),
-        "spot":spot, "upper1":spot*math.exp(up), "upper2":spot*math.exp(2*up)
-    }
-    return {
-        "expiration":expiration,"dte":dte,"spot":spot,
-        "put_iv":piv,"atm_iv":aiv,"call_iv":civ,
-        "skew":piv-civ,"bands":bands,
-        "put_strike":(put.get("details") or {}).get("strike_price"),
-        "call_strike":(call.get("details") or {}).get("strike_price"),
-        "put_delta":(put.get("greeks") or {}).get("delta"),
-        "call_delta":(call.get("greeks") or {}).get("delta"),
-    }
+def implied_vol(price,S,K,T,r,is_call):
+    intrinsic=max(0,S-K*math.exp(-r*T)) if is_call else max(0,K*math.exp(-r*T)-S)
+    if price<=intrinsic or price<=0: return None
+    lo,hi=0.01,5.0
+    if bs_price(S,K,T,r,hi,is_call)<price: return None
+    for _ in range(70):
+        mid=(lo+hi)/2
+        if bs_price(S,K,T,r,mid,is_call)>price: hi=mid
+        else: lo=mid
+    return (lo+hi)/2
+
+def delta(S,K,T,r,sigma,is_call):
+    d1=(math.log(S/K)+(r+0.5*sigma*sigma)*T)/(sigma*math.sqrt(T))
+    return norm_cdf(d1) if is_call else norm_cdf(d1)-1
+
+def expirations(cs):
+    return sorted({c.get("expiration_date") for c in cs if c.get("expiration_date")})
+
+def choose_candidates(cs,exp,S):
+    same=[c for c in cs if c.get("expiration_date")==exp and c.get("strike_price")]
+    calls=sorted([c for c in same if c.get("contract_type")=="call"],key=lambda c:abs(c["strike_price"]-S))
+    puts=sorted([c for c in same if c.get("contract_type")=="put"],key=lambda c:abs(c["strike_price"]-S))
+    # Basic = 5 calls/min. Use only 3 option-price calls:
+    # one ATM-ish call + one downside put + one upside call.
+    atm=min(same,key=lambda c:abs(c["strike_price"]-S)) if same else None
+    put_pool=[c for c in puts if c["strike_price"]<S] or puts
+    call_pool=[c for c in calls if c["strike_price"]>S] or calls
+    # Approximate 25-delta wings by strikes ~8% away, then solve IV/delta from EOD.
+    p=min(put_pool,key=lambda c:abs(c["strike_price"]-S*0.92)) if put_pool else None
+    q=min(call_pool,key=lambda c:abs(c["strike_price"]-S*1.08)) if call_pool else None
+    return atm,p,q
+
+def metrics(t,exp):
+    bs=bars(t,30)
+    if not bs: raise RuntimeError("Prezzo del sottostante non disponibile.")
+    S=float(bs[-1]["c"])
+    cs=contracts(t)
+    atm,p,c=choose_candidates(cs,exp,S)
+    if not atm or not p or not c: raise RuntimeError("Contratti insufficienti per questa scadenza.")
+    ed=datetime.strptime(exp,"%Y-%m-%d").date(); dte=max((ed-date.today()).days,1); T=dte/365
+    rows=[]
+    for x in [atm,p,c]:
+        b=option_prev(x["ticker"])
+        if not b: rows.append(None); continue
+        price=float(b["c"]); K=float(x["strike_price"]); is_call=x["contract_type"]=="call"
+        iv=implied_vol(price,S,K,T,RISK_FREE,is_call)
+        rows.append({"contract":x["ticker"],"strike":K,"type":x["contract_type"],"price":price,"iv":iv,
+                     "delta":delta(S,K,T,RISK_FREE,iv,is_call) if iv else None})
+    a,pr,ca=rows
+    if not a or not pr or not ca or not pr["iv"] or not ca["iv"]:
+        raise RuntimeError("Prezzi EOD insufficienti per calcolare IV su questa scadenza.")
+    aiv=a["iv"] if a and a["iv"] else (pr["iv"]+ca["iv"])/2
+    piv,civ=pr["iv"],ca["iv"]
+    down=piv*math.sqrt(T); up=civ*math.sqrt(T)
+    bands={"lower2":S*math.exp(-2*down),"lower1":S*math.exp(-down),"spot":S,"upper1":S*math.exp(up),"upper2":S*math.exp(2*up)}
+    return {"expiration":exp,"dte":dte,"spot":S,"put_iv":piv,"atm_iv":aiv,"call_iv":civ,"skew":piv-civ,"bands":bands,
+            "put_strike":pr["strike"],"call_strike":ca["strike"],"put_delta":pr["delta"],"call_delta":ca["delta"],
+            "mode":"Massive Basic EOD · IV calcolata localmente","note":"Le wing sono selezionate vicino a ±8% dal prezzo per rispettare il limite di 5 API call/min; il delta risultante è mostrato."}
 
 @app.route("/")
-def home():
-    return render_template("index.html")
+def home(): return render_template("index.html")
 
-@app.get("/api/ticker/<ticker>")
-def ticker(ticker):
+@app.get("/api/ticker/<t>")
+def ticker(t):
     try:
-        d=ticker_details(ticker)
+        t=t.upper(); d=details(t)
         if not d: return jsonify(error="Ticker non trovato."),404
-        if not eligible(d):
-            return jsonify(error="Il titolo non rientra nell'universo: NYSE/Nasdaq e market cap ≥ $1 mld."),400
-        bars=aggs(ticker)
-        chain=all_chain(ticker.upper())
-        exps=expirations(chain)
-        return jsonify(
-            ticker=ticker.upper(), name=d.get("name"), market_cap=d.get("market_cap"),
-            exchange=d.get("primary_exchange"), bars=bars, expirations=exps
-        )
-    except Exception as e:
-        return jsonify(error=str(e)),500
+        if not eligible(d): return jsonify(error="Fuori universo: NYSE/Nasdaq e market cap ≥ $1 mld."),400
+        b=bars(t); cs=contracts(t)
+        return jsonify(ticker=t,name=d.get("name"),market_cap=d.get("market_cap"),exchange=d.get("primary_exchange"),bars=b,expirations=expirations(cs))
+    except Exception as e: return jsonify(error=str(e)),500
 
-@app.get("/api/options/<ticker>")
-def options(ticker):
+@app.get("/api/options/<t>")
+def opts(t):
     try:
         exp=request.args.get("expiration")
-        if not exp: return jsonify(error="Scadenza mancante."),400
-        d=ticker_details(ticker)
-        if not eligible(d): return jsonify(error="Titolo fuori universo."),400
-        chain=all_chain(ticker.upper())
-        return jsonify(option_metrics(chain, exp))
-    except Exception as e:
-        return jsonify(error=str(e)),500
-
-@app.get("/api/search")
-def search():
-    # Massive reference ticker search; each candidate is verified for cap/exchange.
-    q=request.args.get("q","").strip()
-    if not q: return jsonify(results=[])
-    try:
-        j=api("/v3/reference/tickers",{"market":"stocks","active":"true","search":q,"limit":10})
-        results=[]
-        for t in j.get("results",[])[:10]:
-            try:
-                d=ticker_details(t.get("ticker",""))
-                if eligible(d):
-                    results.append({"ticker":d.get("ticker"),"name":d.get("name"),"market_cap":d.get("market_cap")})
-            except Exception:
-                pass
-        return jsonify(results=results)
-    except Exception as e:
-        return jsonify(error=str(e)),500
+        if not exp:return jsonify(error="Scadenza mancante."),400
+        return jsonify(metrics(t.upper(),exp))
+    except Exception as e:return jsonify(error=str(e)),500
 
 @app.get("/health")
-def health():
-    return jsonify(ok=True, api_key_configured=bool(API_KEY))
+def health(): return jsonify(ok=True,api_key_configured=bool(API_KEY),mode="basic-free")
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT","5000")), debug=True)
+if __name__=="__main__": app.run(host="0.0.0.0",port=int(os.getenv("PORT","5000")),debug=True)

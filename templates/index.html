@@ -39,9 +39,9 @@ input{min-width:260px}button{background:var(--accent);color:#08101f;border:0;fon
 </div>
 <div class="card metrics">
 <div class="metric"><span class="muted">Prezzo</span><b id="spot">—</b></div>
-<div class="metric"><span class="muted">IV Put ~25Δ</span><b id="piv">—</b></div>
+<div class="metric"><span class="muted">IV Put downside</span><b id="piv">—</b></div>
 <div class="metric"><span class="muted">IV ATM</span><b id="aiv">—</b></div>
-<div class="metric"><span class="muted">IV Call ~25Δ</span><b id="civ">—</b></div>
+<div class="metric"><span class="muted">IV Call upside</span><b id="civ">—</b></div>
 <div class="metric"><span class="muted">Skew Put − Call</span><b id="skew">—</b></div>
 <div class="metric"><span class="muted">Banda 1σ</span><b id="one">—</b></div>
 <div class="metric"><span class="muted">Banda 2σ</span><b id="two">—</b></div>
@@ -87,11 +87,11 @@ async function loadBands(){
   addLine(b.lower1,'−1σ','#ff7d8d'); addLine(b.lower2,'−2σ','#d56cff');
   $('spot').textContent=money(j.spot); $('piv').textContent=pct(j.put_iv); $('aiv').textContent=pct(j.atm_iv); $('civ').textContent=pct(j.call_iv);
   $('skew').textContent=(j.skew*100).toFixed(2)+' pt'; $('one').textContent=`${money(b.lower1)} → ${money(b.upper1)}`; $('two').textContent=`${money(b.lower2)} → ${money(b.upper2)}`; $('dte').textContent=`${j.expiration} · ${j.dte} gg`;
-  $('msg').textContent=`25Δ Put strike ${j.put_strike} · 25Δ Call strike ${j.call_strike}`;
+  $('msg').textContent=`Put strike ${j.put_strike} (Δ ${j.put_delta?.toFixed(2)}) · Call strike ${j.call_strike} (Δ ${j.call_delta?.toFixed(2)}) · ${j.mode}`;
  }catch(e){$('msg').textContent=e.message} finally{$('bands').disabled=false}
 }
 let timer;
-$('ticker').addEventListener('input',()=>{clearTimeout(timer);const q=$('ticker').value.trim(); if(q.length<2){$('results').style.display='none';return} timer=setTimeout(async()=>{try{const r=await fetch('/api/search?q='+encodeURIComponent(q));const j=await r.json();if(!r.ok)return;$('results').innerHTML=(j.results||[]).map(x=>`<div class="res" data-t="${x.ticker}"><b>${x.ticker}</b> ${x.name}<br><span class="muted">${cap(x.market_cap)}</span></div>`).join('');$('results').style.display=j.results?.length?'block':'none';document.querySelectorAll('.res').forEach(el=>el.addEventListener('click',()=>{$('ticker').value=el.dataset.t;$('results').style.display='none';loadTicker()}))}catch(e){}},350)});
+$('ticker').addEventListener('input',()=>{ return;clearTimeout(timer);const q=$('ticker').value.trim(); if(q.length<2){$('results').style.display='none';return} timer=setTimeout(async()=>{try{const r=await fetch('/api/search?q='+encodeURIComponent(q));const j=await r.json();if(!r.ok)return;$('results').innerHTML=(j.results||[]).map(x=>`<div class="res" data-t="${x.ticker}"><b>${x.ticker}</b> ${x.name}<br><span class="muted">${cap(x.market_cap)}</span></div>`).join('');$('results').style.display=j.results?.length?'block':'none';document.querySelectorAll('.res').forEach(el=>el.addEventListener('click',()=>{$('ticker').value=el.dataset.t;$('results').style.display='none';loadTicker()}))}catch(e){}},350)});
 $('load').addEventListener('click',loadTicker); $('bands').addEventListener('click',loadBands); $('exp').addEventListener('change',loadBands); $('ticker').addEventListener('keydown',e=>{if(e.key==='Enter')loadTicker()});
 </script>
 </body></html>
