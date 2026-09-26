@@ -1,11 +1,10 @@
-# Option Bands — Massive Basic gratuito
+# Option Bands v2 — Massive Basic gratuito
 
-Versione senza Option Chain Snapshot. Usa:
-- reference options contracts
-- EOD stock aggregates
-- previous-day option aggregate prices
-- Black-Scholes locale per ricavare IV e delta
+Novità:
+- Posizione IV in sigma
+- storico giornaliero SQLite
+- endpoint /api/history/<ticker>
+- screener sotto il grafico basato sugli ultimi valori salvati
+- IV/delta calcolati localmente, senza Option Chain Snapshot
 
-Limite Massive Basic: 5 API calls/min. L'app usa cache server-side e solo 3 contratti per il calcolo delle bande.
-
-Su GitHub sostituisci app.py e templates/index.html con questi file. Render effettuerà il redeploy automaticamente.
+Nota importante: su Render Free il filesystem locale è effimero. SQLite è utile per testare, ma per conservare davvero lo storico tra restart/deploy serve un database persistente (es. Postgres).

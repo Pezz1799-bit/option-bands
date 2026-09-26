@@ -1,5 +1,5 @@
 
-import os, math, time
+import os, math, time, sqlite3
 from datetime import date, timedelta, datetime
 from flask import Flask, render_template, request, jsonify
 import requests
@@ -12,6 +12,34 @@ ALLOWED_EXCHANGES={"XNAS","XNYS"}
 RISK_FREE=0.04
 CACHE={}
 CACHE_TTL=3600
+DB_PATH=os.getenv("DB_PATH","/tmp/option_bands.db")
+
+def db():
+    con=sqlite3.connect(DB_PATH)
+    con.execute("""CREATE TABLE IF NOT EXISTS band_history (
+        day TEXT NOT NULL, ticker TEXT NOT NULL, expiration TEXT NOT NULL,
+        spot REAL, put_iv REAL, atm_iv REAL, call_iv REAL, skew REAL,
+        lower2 REAL, lower1 REAL, upper1 REAL, upper2 REAL, iv_position REAL,
+        PRIMARY KEY(day,ticker,expiration)
+    )""")
+    return con
+
+def iv_position(spot, reference_spot, put_iv, call_iv, T):
+    if not reference_spot or reference_spot<=0 or T<=0: return 0.0
+    move=math.log(spot/reference_spot)
+    sigma=(call_iv if move>=0 else put_iv)*math.sqrt(T)
+    return move/sigma if sigma>0 else 0.0
+
+def save_history(ticker, data):
+    con=db()
+    b=data["bands"]
+    con.execute("""INSERT OR REPLACE INTO band_history
+      (day,ticker,expiration,spot,put_iv,atm_iv,call_iv,skew,lower2,lower1,upper1,upper2,iv_position)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+      (date.today().isoformat(),ticker,data["expiration"],data["spot"],data["put_iv"],data["atm_iv"],
+       data["call_iv"],data["skew"],b["lower2"],b["lower1"],b["upper1"],b["upper2"],data["iv_position"]))
+    con.commit(); con.close()
+
 
 def cached(key, fn):
     now=time.time()
@@ -116,9 +144,15 @@ def metrics(t,exp):
     piv,civ=pr["iv"],ca["iv"]
     down=piv*math.sqrt(T); up=civ*math.sqrt(T)
     bands={"lower2":S*math.exp(-2*down),"lower1":S*math.exp(-down),"spot":S,"upper1":S*math.exp(up),"upper2":S*math.exp(2*up)}
-    return {"expiration":exp,"dte":dte,"spot":S,"put_iv":piv,"atm_iv":aiv,"call_iv":civ,"skew":piv-civ,"bands":bands,
-            "put_strike":pr["strike"],"call_strike":ca["strike"],"put_delta":pr["delta"],"call_delta":ca["delta"],
-            "mode":"Massive Basic EOD · IV calcolata localmente","note":"Le wing sono selezionate vicino a ±8% dal prezzo per rispettare il limite di 5 API call/min; il delta risultante è mostrato."}
+    # Reference is today's EOD spot for the newly calculated surface. The live position is 0 at creation;
+    # future stored observations can be compared with this reference.
+    pos=iv_position(S,S,piv,civ,T)
+    result={"expiration":exp,"dte":dte,"spot":S,"reference_spot":S,"put_iv":piv,"atm_iv":aiv,"call_iv":civ,
+            "skew":piv-civ,"iv_position":pos,"bands":bands,"put_strike":pr["strike"],"call_strike":ca["strike"],
+            "put_delta":pr["delta"],"call_delta":ca["delta"],"mode":"Massive Basic EOD · IV calcolata localmente",
+            "note":"Le wing sono selezionate vicino a ±8% dal prezzo per rispettare il limite di 5 API call/min; il delta risultante è mostrato."}
+    save_history(t, result)
+    return result
 
 @app.route("/")
 def home(): return render_template("index.html")
@@ -140,6 +174,22 @@ def opts(t):
         if not exp:return jsonify(error="Scadenza mancante."),400
         return jsonify(metrics(t.upper(),exp))
     except Exception as e:return jsonify(error=str(e)),500
+
+@app.get("/api/history/<t>")
+def history(t):
+    con=db(); con.row_factory=sqlite3.Row
+    rows=con.execute("SELECT * FROM band_history WHERE ticker=? ORDER BY day DESC LIMIT 365",(t.upper(),)).fetchall()
+    con.close()
+    return jsonify(results=[dict(x) for x in rows])
+
+@app.get("/api/screener")
+def screener():
+    con=db(); con.row_factory=sqlite3.Row
+    rows=con.execute("""SELECT h.* FROM band_history h JOIN
+      (SELECT ticker,MAX(day) day FROM band_history GROUP BY ticker) x
+      ON h.ticker=x.ticker AND h.day=x.day ORDER BY ABS(h.iv_position) DESC""").fetchall()
+    con.close()
+    return jsonify(results=[dict(x) for x in rows])
 
 @app.get("/health")
 def health(): return jsonify(ok=True,api_key_configured=bool(API_KEY),mode="basic-free")

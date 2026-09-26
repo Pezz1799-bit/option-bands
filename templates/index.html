@@ -48,6 +48,21 @@ input{min-width:260px}button{background:var(--accent);color:#08101f;border:0;fon
 <div class="metric"><span class="muted">Scadenza</span><b id="dte">—</b></div>
 </div>
 </div>
+
+<div class="card" style="margin-top:14px">
+  <div style="font-weight:700;margin-bottom:8px">Posizione IV</div>
+  <div id="ivPosition" style="font-size:28px;font-weight:800">—</div>
+  <div style="opacity:.7;font-size:12px">Posizione del prezzo rispetto al movimento implicito asimmetrico</div>
+</div>
+<div class="card" style="margin-top:14px">
+  <div style="font-weight:700;margin-bottom:10px">Screener — ultimi valori salvati</div>
+  <div style="overflow:auto">
+    <table style="width:100%;border-collapse:collapse">
+      <thead><tr><th>Ticker</th><th>Prezzo</th><th>Posizione IV</th><th>IV Put</th><th>IV Call</th><th>Skew</th></tr></thead>
+      <tbody id="screenerBody"><tr><td colspan="6">Nessun dato salvato ancora.</td></tr></tbody>
+    </table>
+  </div>
+</div>
 </main>
 <script>
 const $=id=>document.getElementById(id); let chart,candles,lines=[];
@@ -93,5 +108,17 @@ async function loadBands(){
 let timer;
 $('ticker').addEventListener('input',()=>{ return;clearTimeout(timer);const q=$('ticker').value.trim(); if(q.length<2){$('results').style.display='none';return} timer=setTimeout(async()=>{try{const r=await fetch('/api/search?q='+encodeURIComponent(q));const j=await r.json();if(!r.ok)return;$('results').innerHTML=(j.results||[]).map(x=>`<div class="res" data-t="${x.ticker}"><b>${x.ticker}</b> ${x.name}<br><span class="muted">${cap(x.market_cap)}</span></div>`).join('');$('results').style.display=j.results?.length?'block':'none';document.querySelectorAll('.res').forEach(el=>el.addEventListener('click',()=>{$('ticker').value=el.dataset.t;$('results').style.display='none';loadTicker()}))}catch(e){}},350)});
 $('load').addEventListener('click',loadTicker); $('bands').addEventListener('click',loadBands); $('exp').addEventListener('change',loadBands); $('ticker').addEventListener('keydown',e=>{if(e.key==='Enter')loadTicker()});
+
+async function refreshScreener(){
+  try{
+    const r=await fetch('/api/screener'); const j=await r.json();
+    const b=document.getElementById('screenerBody'); if(!b)return;
+    if(!j.results || !j.results.length){b.innerHTML='<tr><td colspan="6">Nessun dato salvato ancora.</td></tr>';return;}
+    b.innerHTML=j.results.map(x=>`<tr style="cursor:pointer" onclick="document.getElementById('ticker').value='${x.ticker}';document.getElementById('loadBtn')?.click()">
+      <td>${x.ticker}</td><td>${Number(x.spot).toFixed(2)}</td><td>${Number(x.iv_position).toFixed(2)}σ</td>
+      <td>${(100*Number(x.put_iv)).toFixed(1)}%</td><td>${(100*Number(x.call_iv)).toFixed(1)}%</td><td>${(100*Number(x.skew)).toFixed(1)}%</td></tr>`).join('');
+  }catch(e){}
+}
+document.addEventListener('DOMContentLoaded',refreshScreener);
 </script>
 </body></html>
