@@ -7,10 +7,10 @@ app=Flask(__name__); BASE='https://api.massive.com'; API_KEY=os.getenv('MASSIVE_
 SCAN={'running':False,'done':0,'total':0,'ok':0,'errors':0,'ticker':'','started':None,'finished':None,'message':'Pronto'}; LOCK=threading.Lock()
 
 def db():
-    con=sqlite3.connect(DB_PATH,check_same_thread=False); con.execute('''CREATE TABLE IF NOT EXISTS band_history(day TEXT NOT NULL,ticker TEXT NOT NULL,expiration TEXT NOT NULL,spot REAL,put_iv REAL,atm_iv REAL,call_iv REAL,skew REAL,lower2 REAL,lower1 REAL,upper1 REAL,upper2 REAL,iv_position REAL,reference_spot REAL,current_spot REAL,put_delta REAL,call_delta REAL,put_strike REAL,call_strike REAL,PRIMARY KEY(day,ticker,expiration))'''); con.execute('''CREATE TABLE IF NOT EXISTS scan_results(day TEXT NOT NULL,ticker TEXT NOT NULL,expiration TEXT,spot REAL,put_iv REAL,call_iv REAL,skew REAL,lower2 REAL,lower1 REAL,upper1 REAL,upper2 REAL,iv_position REAL,zone TEXT,call_wall_below_score REAL,call_wall_below_strike REAL,call_wall_below_oi REAL,put_wall_above_score REAL,put_wall_above_strike REAL,put_wall_above_oi REAL,PRIMARY KEY(day,ticker))'''); 
+    con=sqlite3.connect(DB_PATH,check_same_thread=False); con.execute('''CREATE TABLE IF NOT EXISTS band_history(day TEXT NOT NULL,ticker TEXT NOT NULL,expiration TEXT NOT NULL,spot REAL,put_iv REAL,atm_iv REAL,call_iv REAL,skew REAL,lower2 REAL,lower1 REAL,upper1 REAL,upper2 REAL,iv_position REAL,reference_spot REAL,current_spot REAL,put_delta REAL,call_delta REAL,put_strike REAL,call_strike REAL,PRIMARY KEY(day,ticker,expiration))'''); con.execute('''CREATE TABLE IF NOT EXISTS scan_results(day TEXT NOT NULL,ticker TEXT NOT NULL,expiration TEXT,spot REAL,put_iv REAL,call_iv REAL,skew REAL,lower2 REAL,lower1 REAL,upper1 REAL,upper2 REAL,iv_position REAL,zone TEXT,call_wall_below_score REAL,call_wall_below_strike REAL,call_wall_below_oi REAL,put_wall_above_score REAL,put_wall_above_strike REAL,put_wall_above_oi REAL,put_call_ratio REAL,gex_estimate REAL,PRIMARY KEY(day,ticker))'''); 
     # Lightweight migration for databases created by previous versions.
     cols={r[1] for r in con.execute('PRAGMA table_info(scan_results)').fetchall()}
-    for name in ['call_wall_below_score','call_wall_below_strike','call_wall_below_oi','put_wall_above_score','put_wall_above_strike','put_wall_above_oi']:
+    for name in ['call_wall_below_score','call_wall_below_strike','call_wall_below_oi','put_wall_above_score','put_wall_above_strike','put_wall_above_oi','put_call_ratio','gex_estimate']:
         if name not in cols: con.execute(f'ALTER TABLE scan_results ADD COLUMN {name} REAL')
     con.commit(); return con
 
@@ -91,17 +91,34 @@ def wall_profile(rows,S):
         return {'score':score,'strike':best['strike'],'oi':best['oi']}
     return levels,wall('call','below'),wall('put','above')
 
+def chain_metrics(rows,S):
+    call_oi=put_oi=0.0; call_gex=put_gex=0.0
+    for x in rows:
+        d=x.get('details') or {}; kind=d.get('contract_type'); oi=option_oi(x)
+        if kind not in {'call','put'} or oi<=0: continue
+        if kind=='call': call_oi+=oi
+        else: put_oi+=oi
+        try: gamma=max(0.0,float((x.get('greeks') or {}).get('gamma') or 0))
+        except: gamma=0.0
+        # GEX per movimento dell'1% del sottostante, moltiplicatore standard equity option = 100.
+        gex=gamma*oi*100.0*S*S*0.01
+        if kind=='call': call_gex+=gex
+        else: put_gex+=gex
+    pcr=(put_oi/call_oi) if call_oi>0 else None
+    # Convenzione proxy: call GEX positivo, put GEX negativo. Non identifica il vero lato dealer.
+    return {'call_oi':call_oi,'put_oi':put_oi,'put_call_ratio':pcr,'call_gex':call_gex,'put_gex':-put_gex,'net_gex':call_gex-put_gex}
+
 def calc(t,exp,save=True):
     bs=bars(t,30); S=float(bs[-1]['c']) if bs else 0
     if S<=0: raise RuntimeError('Prezzo non disponibile')
-    rows=chain(t,exp); levels,call_wall,put_wall=wall_profile(rows,S); put=pick(rows,'put'); call=pick(rows,'call')
+    rows=chain(t,exp); levels,call_wall,put_wall=wall_profile(rows,S); cm=chain_metrics(rows,S); put=pick(rows,'put'); call=pick(rows,'call')
     if not put or not call: raise RuntimeError('25Δ non disponibili')
     piv=float(put['implied_volatility']); civ=float(call['implied_volatility']); aiv=atm_iv(rows,S) or (piv+civ)/2; dte=max((datetime.strptime(exp,'%Y-%m-%d').date()-date.today()).days,1); T=dte/365; down=piv*math.sqrt(T); up=civ*math.sqrt(T); b={'lower2':S*math.exp(-2*down),'lower1':S*math.exp(-down),'upper1':S*math.exp(up),'upper2':S*math.exp(2*up)}
     # Position vs previous saved box: meaningful for screener and oscillator.
     con=db(); con.row_factory=sqlite3.Row; prev=con.execute('SELECT * FROM band_history WHERE ticker=? AND day<? ORDER BY day DESC LIMIT 1',(t,date.today().isoformat())).fetchone(); pos=0.0
     if prev and prev['reference_spot'] and S>0:
         move=math.log(S/prev['reference_spot']); oldT=max((datetime.strptime(prev['expiration'],'%Y-%m-%d').date()-date.today()).days,1)/365; sig=(prev['call_iv'] if move>=0 else prev['put_iv'])*math.sqrt(oldT); pos=move/sig if sig>0 else 0
-    pd,pg=put['details'],put['greeks']; cd,cg=call['details'],call['greeks']; out={'expiration':exp,'dte':dte,'spot':S,'reference_spot':S,'put_iv':piv,'atm_iv':aiv,'call_iv':civ,'skew':piv-civ,'iv_position':pos,'bands':b,'put_strike':float(pd['strike_price']),'call_strike':float(cd['strike_price']),'put_delta':float(pg['delta']),'call_delta':float(cg['delta']),'mode':'Snapshot · 25Δ reali','option_profile':levels,'call_wall_below':call_wall,'put_wall_above':put_wall}
+    pd,pg=put['details'],put['greeks']; cd,cg=call['details'],call['greeks']; out={'expiration':exp,'dte':dte,'spot':S,'reference_spot':S,'put_iv':piv,'atm_iv':aiv,'call_iv':civ,'skew':piv-civ,'iv_position':pos,'bands':b,'put_strike':float(pd['strike_price']),'call_strike':float(cd['strike_price']),'put_delta':float(pg['delta']),'call_delta':float(cg['delta']),'mode':'Snapshot · 25Δ reali','option_profile':levels,'call_wall_below':call_wall,'put_wall_above':put_wall,'put_call_ratio':cm['put_call_ratio'],'call_oi_total':cm['call_oi'],'put_oi_total':cm['put_oi'],'gex_estimate':cm['net_gex'],'call_gex_estimate':cm['call_gex'],'put_gex_estimate':cm['put_gex']}
     if save:
         con.execute('''INSERT OR REPLACE INTO band_history(day,ticker,expiration,spot,put_iv,atm_iv,call_iv,skew,lower2,lower1,upper1,upper2,iv_position,reference_spot,current_spot,put_delta,call_delta,put_strike,call_strike) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(date.today().isoformat(),t,exp,S,piv,aiv,civ,piv-civ,b['lower2'],b['lower1'],b['upper1'],b['upper2'],pos,S,S,out['put_delta'],out['call_delta'],out['put_strike'],out['call_strike'])); con.commit()
     con.close(); return out
@@ -130,7 +147,7 @@ def scan_worker(limit=0):
             try:
                 ex=expirations(t); e=target_exp(ex,30)
                 if not e: raise RuntimeError('no expiry')
-                m=calc(t,e,True); b=m['bands']; z=zone(m['iv_position']); con=db(); con.execute('''INSERT OR REPLACE INTO scan_results(day,ticker,expiration,spot,put_iv,call_iv,skew,lower2,lower1,upper1,upper2,iv_position,zone,call_wall_below_score,call_wall_below_strike,call_wall_below_oi,put_wall_above_score,put_wall_above_strike,put_wall_above_oi) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(date.today().isoformat(),t,e,m['spot'],m['put_iv'],m['call_iv'],m['skew'],b['lower2'],b['lower1'],b['upper1'],b['upper2'],m['iv_position'],z,m['call_wall_below']['score'],m['call_wall_below']['strike'],m['call_wall_below']['oi'],m['put_wall_above']['score'],m['put_wall_above']['strike'],m['put_wall_above']['oi'])); con.commit(); con.close()
+                m=calc(t,e,True); b=m['bands']; z=zone(m['iv_position']); con=db(); con.execute('''INSERT OR REPLACE INTO scan_results(day,ticker,expiration,spot,put_iv,call_iv,skew,lower2,lower1,upper1,upper2,iv_position,zone,call_wall_below_score,call_wall_below_strike,call_wall_below_oi,put_wall_above_score,put_wall_above_strike,put_wall_above_oi,put_call_ratio,gex_estimate) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(date.today().isoformat(),t,e,m['spot'],m['put_iv'],m['call_iv'],m['skew'],b['lower2'],b['lower1'],b['upper1'],b['upper2'],m['iv_position'],z,m['call_wall_below']['score'],m['call_wall_below']['strike'],m['call_wall_below']['oi'],m['put_wall_above']['score'],m['put_wall_above']['strike'],m['put_wall_above']['oi'],m['put_call_ratio'],m['gex_estimate'])); con.commit(); con.close()
                 with LOCK: SCAN['ok']+=1
             except Exception: 
                 with LOCK: SCAN['errors']+=1
@@ -172,10 +189,13 @@ def screener():
     elif z=='callwall': q+=' AND call_wall_below_score>=70'
     elif z=='putwall': q+=' AND put_wall_above_score>=70'
     elif z=='walls': q+=' AND (call_wall_below_score>=70 OR put_wall_above_score>=70)'
+    elif z=='pcr1': q+=' AND put_call_ratio>1'
     if z=='callwall': q+=' ORDER BY call_wall_below_score DESC'
     elif z=='putwall': q+=' ORDER BY put_wall_above_score DESC'
     elif z=='walls': q+=' ORDER BY MAX(COALESCE(call_wall_below_score,0),COALESCE(put_wall_above_score,0)) DESC'
-    else: q+=' ORDER BY iv_position ASC'; r=con.execute(q,a).fetchall(); con.close(); return jsonify(results=[dict(x) for x in r])
+    elif z=='pcr1': q+=' ORDER BY put_call_ratio DESC'
+    else: q+=' ORDER BY iv_position ASC'
+    r=con.execute(q,a).fetchall(); con.close(); return jsonify(results=[dict(x) for x in r])
 @app.get('/health')
-def health():return jsonify(ok=True,mode='v5-option-walls')
+def health():return jsonify(ok=True,mode='v5.2-option-walls-pcr-gex')
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','5000')))
