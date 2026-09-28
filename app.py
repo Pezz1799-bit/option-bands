@@ -7,7 +7,12 @@ app=Flask(__name__); BASE='https://api.massive.com'; API_KEY=os.getenv('MASSIVE_
 SCAN={'running':False,'done':0,'total':0,'ok':0,'errors':0,'ticker':'','started':None,'finished':None,'message':'Pronto'}; LOCK=threading.Lock()
 
 def db():
-    con=sqlite3.connect(DB_PATH,check_same_thread=False); con.execute('''CREATE TABLE IF NOT EXISTS band_history(day TEXT NOT NULL,ticker TEXT NOT NULL,expiration TEXT NOT NULL,spot REAL,put_iv REAL,atm_iv REAL,call_iv REAL,skew REAL,lower2 REAL,lower1 REAL,upper1 REAL,upper2 REAL,iv_position REAL,reference_spot REAL,current_spot REAL,put_delta REAL,call_delta REAL,put_strike REAL,call_strike REAL,PRIMARY KEY(day,ticker,expiration))'''); con.execute('''CREATE TABLE IF NOT EXISTS scan_results(day TEXT NOT NULL,ticker TEXT NOT NULL,expiration TEXT,spot REAL,put_iv REAL,call_iv REAL,skew REAL,lower2 REAL,lower1 REAL,upper1 REAL,upper2 REAL,iv_position REAL,zone TEXT,PRIMARY KEY(day,ticker))'''); con.commit(); return con
+    con=sqlite3.connect(DB_PATH,check_same_thread=False); con.execute('''CREATE TABLE IF NOT EXISTS band_history(day TEXT NOT NULL,ticker TEXT NOT NULL,expiration TEXT NOT NULL,spot REAL,put_iv REAL,atm_iv REAL,call_iv REAL,skew REAL,lower2 REAL,lower1 REAL,upper1 REAL,upper2 REAL,iv_position REAL,reference_spot REAL,current_spot REAL,put_delta REAL,call_delta REAL,put_strike REAL,call_strike REAL,PRIMARY KEY(day,ticker,expiration))'''); con.execute('''CREATE TABLE IF NOT EXISTS scan_results(day TEXT NOT NULL,ticker TEXT NOT NULL,expiration TEXT,spot REAL,put_iv REAL,call_iv REAL,skew REAL,lower2 REAL,lower1 REAL,upper1 REAL,upper2 REAL,iv_position REAL,zone TEXT,call_wall_below_score REAL,call_wall_below_strike REAL,call_wall_below_oi REAL,put_wall_above_score REAL,put_wall_above_strike REAL,put_wall_above_oi REAL,PRIMARY KEY(day,ticker))'''); 
+    # Lightweight migration for databases created by previous versions.
+    cols={r[1] for r in con.execute('PRAGMA table_info(scan_results)').fetchall()}
+    for name in ['call_wall_below_score','call_wall_below_strike','call_wall_below_oi','put_wall_above_score','put_wall_above_strike','put_wall_above_oi']:
+        if name not in cols: con.execute(f'ALTER TABLE scan_results ADD COLUMN {name} REAL')
+    con.commit(); return con
 
 def cached(key,fn,ttl=CACHE_TTL):
     now=time.time()
@@ -54,17 +59,49 @@ def pick(rows,kind):
 def atm_iv(rows,S):
     p=sorted([x for x in rows if valid(x)],key=lambda x:abs(float((x.get('details') or {}).get('strike_price'))-S))[:6]; return sum(float(x['implied_volatility']) for x in p)/len(p) if p else None
 
+def option_oi(x):
+    try: return max(0.0,float(x.get('open_interest') or 0))
+    except: return 0.0
+
+def wall_profile(rows,S):
+    levels=[]
+    for x in rows:
+        d=x.get('details') or {}; kind=d.get('contract_type'); strike=d.get('strike_price')
+        try: strike=float(strike)
+        except: continue
+        if kind not in {'call','put'} or strike<=0: continue
+        oi=option_oi(x)
+        if oi<=0: continue
+        levels.append({'strike':strike,'type':kind,'oi':oi})
+    # Aggregate duplicate strike/type contracts defensively.
+    agg={}
+    for x in levels:
+        k=(x['strike'],x['type']); agg[k]=agg.get(k,0.0)+x['oi']
+    levels=[{'strike':k[0],'type':k[1],'oi':v} for k,v in agg.items()]
+    maxoi=max([x['oi'] for x in levels],default=1.0)
+    for x in levels: x['relative']=100.0*x['oi']/maxoi if maxoi else 0.0
+    def wall(kind,side):
+        pool=[x for x in levels if x['type']==kind and ((x['strike']<S) if side=='below' else (x['strike']>S))]
+        if not pool:return {'score':0.0,'strike':None,'oi':0.0}
+        vals=sorted(x['oi'] for x in pool); med=vals[len(vals)//2] if vals else 0.0
+        best=max(pool,key=lambda x:x['oi']); ratio=best['oi']/med if med>0 else (1.0 if best['oi']>0 else 0.0)
+        # 0-100 concentration score: combines share of same-side OI and anomaly vs median strike.
+        share=best['oi']/sum(x['oi'] for x in pool) if pool else 0.0
+        score=min(100.0,100.0*(0.65*min(1.0,share*4.0)+0.35*min(1.0,ratio/5.0)))
+        return {'score':score,'strike':best['strike'],'oi':best['oi']}
+    return levels,wall('call','below'),wall('put','above')
+
 def calc(t,exp,save=True):
     bs=bars(t,30); S=float(bs[-1]['c']) if bs else 0
     if S<=0: raise RuntimeError('Prezzo non disponibile')
-    rows=chain(t,exp); put=pick(rows,'put'); call=pick(rows,'call')
+    rows=chain(t,exp); levels,call_wall,put_wall=wall_profile(rows,S); put=pick(rows,'put'); call=pick(rows,'call')
     if not put or not call: raise RuntimeError('25Δ non disponibili')
     piv=float(put['implied_volatility']); civ=float(call['implied_volatility']); aiv=atm_iv(rows,S) or (piv+civ)/2; dte=max((datetime.strptime(exp,'%Y-%m-%d').date()-date.today()).days,1); T=dte/365; down=piv*math.sqrt(T); up=civ*math.sqrt(T); b={'lower2':S*math.exp(-2*down),'lower1':S*math.exp(-down),'upper1':S*math.exp(up),'upper2':S*math.exp(2*up)}
     # Position vs previous saved box: meaningful for screener and oscillator.
     con=db(); con.row_factory=sqlite3.Row; prev=con.execute('SELECT * FROM band_history WHERE ticker=? AND day<? ORDER BY day DESC LIMIT 1',(t,date.today().isoformat())).fetchone(); pos=0.0
     if prev and prev['reference_spot'] and S>0:
         move=math.log(S/prev['reference_spot']); oldT=max((datetime.strptime(prev['expiration'],'%Y-%m-%d').date()-date.today()).days,1)/365; sig=(prev['call_iv'] if move>=0 else prev['put_iv'])*math.sqrt(oldT); pos=move/sig if sig>0 else 0
-    pd,pg=put['details'],put['greeks']; cd,cg=call['details'],call['greeks']; out={'expiration':exp,'dte':dte,'spot':S,'reference_spot':S,'put_iv':piv,'atm_iv':aiv,'call_iv':civ,'skew':piv-civ,'iv_position':pos,'bands':b,'put_strike':float(pd['strike_price']),'call_strike':float(cd['strike_price']),'put_delta':float(pg['delta']),'call_delta':float(cg['delta']),'mode':'Snapshot · 25Δ reali'}
+    pd,pg=put['details'],put['greeks']; cd,cg=call['details'],call['greeks']; out={'expiration':exp,'dte':dte,'spot':S,'reference_spot':S,'put_iv':piv,'atm_iv':aiv,'call_iv':civ,'skew':piv-civ,'iv_position':pos,'bands':b,'put_strike':float(pd['strike_price']),'call_strike':float(cd['strike_price']),'put_delta':float(pg['delta']),'call_delta':float(cg['delta']),'mode':'Snapshot · 25Δ reali','option_profile':levels,'call_wall_below':call_wall,'put_wall_above':put_wall}
     if save:
         con.execute('''INSERT OR REPLACE INTO band_history(day,ticker,expiration,spot,put_iv,atm_iv,call_iv,skew,lower2,lower1,upper1,upper2,iv_position,reference_spot,current_spot,put_delta,call_delta,put_strike,call_strike) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(date.today().isoformat(),t,exp,S,piv,aiv,civ,piv-civ,b['lower2'],b['lower1'],b['upper1'],b['upper2'],pos,S,S,out['put_delta'],out['call_delta'],out['put_strike'],out['call_strike'])); con.commit()
     con.close(); return out
@@ -93,7 +130,7 @@ def scan_worker(limit=0):
             try:
                 ex=expirations(t); e=target_exp(ex,30)
                 if not e: raise RuntimeError('no expiry')
-                m=calc(t,e,True); b=m['bands']; z=zone(m['iv_position']); con=db(); con.execute('''INSERT OR REPLACE INTO scan_results(day,ticker,expiration,spot,put_iv,call_iv,skew,lower2,lower1,upper1,upper2,iv_position,zone) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',(date.today().isoformat(),t,e,m['spot'],m['put_iv'],m['call_iv'],m['skew'],b['lower2'],b['lower1'],b['upper1'],b['upper2'],m['iv_position'],z)); con.commit(); con.close()
+                m=calc(t,e,True); b=m['bands']; z=zone(m['iv_position']); con=db(); con.execute('''INSERT OR REPLACE INTO scan_results(day,ticker,expiration,spot,put_iv,call_iv,skew,lower2,lower1,upper1,upper2,iv_position,zone,call_wall_below_score,call_wall_below_strike,call_wall_below_oi,put_wall_above_score,put_wall_above_strike,put_wall_above_oi) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(date.today().isoformat(),t,e,m['spot'],m['put_iv'],m['call_iv'],m['skew'],b['lower2'],b['lower1'],b['upper1'],b['upper2'],m['iv_position'],z,m['call_wall_below']['score'],m['call_wall_below']['strike'],m['call_wall_below']['oi'],m['put_wall_above']['score'],m['put_wall_above']['strike'],m['put_wall_above']['oi'])); con.commit(); con.close()
                 with LOCK: SCAN['ok']+=1
             except Exception: 
                 with LOCK: SCAN['errors']+=1
@@ -132,7 +169,13 @@ def screener():
     elif z=='minus1': q+=' AND iv_position<=-1'
     elif z=='plus1': q+=' AND iv_position>=1'
     elif z=='plus2': q+=' AND iv_position>=2'
-    q+=' ORDER BY iv_position ASC'; r=con.execute(q,a).fetchall(); con.close(); return jsonify(results=[dict(x) for x in r])
+    elif z=='callwall': q+=' AND call_wall_below_score>=70'
+    elif z=='putwall': q+=' AND put_wall_above_score>=70'
+    elif z=='walls': q+=' AND (call_wall_below_score>=70 OR put_wall_above_score>=70)'
+    if z=='callwall': q+=' ORDER BY call_wall_below_score DESC'
+    elif z=='putwall': q+=' ORDER BY put_wall_above_score DESC'
+    elif z=='walls': q+=' ORDER BY MAX(COALESCE(call_wall_below_score,0),COALESCE(put_wall_above_score,0)) DESC'
+    else: q+=' ORDER BY iv_position ASC'; r=con.execute(q,a).fetchall(); con.close(); return jsonify(results=[dict(x) for x in r])
 @app.get('/health')
-def health():return jsonify(ok=True,mode='v4-market-scanner-25d')
+def health():return jsonify(ok=True,mode='v5-option-walls')
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','5000')))
