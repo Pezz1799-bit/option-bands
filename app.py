@@ -4,7 +4,7 @@ from flask import Flask, render_template, request, jsonify
 import requests
 
 app=Flask(__name__); BASE='https://api.massive.com'; API_KEY=os.getenv('MASSIVE_API_KEY','').strip(); DB_PATH=os.getenv('DB_PATH','/tmp/option_bands.db'); CACHE={}; CACHE_TTL=900
-SCAN={'running':False,'done':0,'total':0,'ok':0,'errors':0,'ticker':'','started':None,'finished':None,'message':'Pronto'}; LOCK=threading.Lock()
+SCAN={'running':False,'done':0,'total':0,'ok':0,'no_data':0,'api_errors':0,'errors':0,'ticker':'','started':None,'finished':None,'message':'Pronto'}; LOCK=threading.Lock()
 
 def db():
     con=sqlite3.connect(DB_PATH,check_same_thread=False); con.execute('''CREATE TABLE IF NOT EXISTS band_history(day TEXT NOT NULL,ticker TEXT NOT NULL,expiration TEXT NOT NULL,spot REAL,put_iv REAL,atm_iv REAL,call_iv REAL,skew REAL,lower2 REAL,lower1 REAL,upper1 REAL,upper2 REAL,iv_position REAL,reference_spot REAL,current_spot REAL,put_delta REAL,call_delta REAL,put_strike REAL,call_strike REAL,PRIMARY KEY(day,ticker,expiration))'''); con.execute('''CREATE TABLE IF NOT EXISTS scan_results(day TEXT NOT NULL,ticker TEXT NOT NULL,expiration TEXT,spot REAL,put_iv REAL,call_iv REAL,skew REAL,lower2 REAL,lower1 REAL,upper1 REAL,upper2 REAL,iv_position REAL,zone TEXT,call_wall_below_score REAL,call_wall_below_strike REAL,call_wall_below_oi REAL,put_wall_above_score REAL,put_wall_above_strike REAL,put_wall_above_oi REAL,put_call_ratio REAL,gex_estimate REAL,skew_left_score REAL,skew_spot_position REAL,skew_left_iv REAL,skew_right_iv REAL,PRIMARY KEY(day,ticker))'''); 
@@ -21,10 +21,19 @@ def cached(key,fn,ttl=CACHE_TTL):
 
 def api(path_or_url,params=None):
     if not API_KEY: raise RuntimeError('MASSIVE_API_KEY non configurata.')
-    url=path_or_url if path_or_url.startswith('http') else BASE+path_or_url; p=dict(params or {}); p['apiKey']=API_KEY; r=requests.get(url,params=p,timeout=45)
-    if r.status_code==429: raise RuntimeError('Limite API Massive raggiunto.')
-    if r.status_code==403: raise RuntimeError('Endpoint non incluso nel piano Massive attivo.')
-    r.raise_for_status(); return r.json()
+    url=path_or_url if path_or_url.startswith('http') else BASE+path_or_url; p=dict(params or {}); p['apiKey']=API_KEY
+    last=None
+    for attempt in range(5):
+        try:
+            r=requests.get(url,params=p,timeout=45)
+            if r.status_code==429:
+                time.sleep(min(12,1.5*(2**attempt))); continue
+            if r.status_code==403: raise RuntimeError('Endpoint non incluso nel piano Massive attivo.')
+            r.raise_for_status(); return r.json()
+        except requests.RequestException as e:
+            last=e
+            if attempt<4: time.sleep(min(8,1.0*(2**attempt)))
+    raise RuntimeError('Errore API Massive dopo retry: '+str(last or 'rate limit'))
 
 def bars(t,days=365):
     def load():
@@ -136,7 +145,13 @@ def calc(t,exp,save=True):
     bs=bars(t,30); S=float(bs[-1]['c']) if bs else 0
     if S<=0: raise RuntimeError('Prezzo non disponibile')
     rows=chain(t,exp); skew_curve,skew_shape=volatility_skew(rows,S); oi_levels,call_wall_oi,put_wall_oi=wall_profile(rows,S,'oi'); volume_levels,call_wall_volume,put_wall_volume=wall_profile(rows,S,'volume'); cm=chain_metrics(rows,S); put=pick(rows,'put'); call=pick(rows,'call')
-    if not put or not call: raise RuntimeError('25Δ non disponibili')
+    if not put:
+        pp=[x for x in rows if valid(x) and (x.get('details') or {}).get('contract_type')=='put']
+        put=min(pp,key=lambda x:abs(float((x.get('details') or {}).get('strike_price'))-S)) if pp else None
+    if not call:
+        cc=[x for x in rows if valid(x) and (x.get('details') or {}).get('contract_type')=='call']
+        call=min(cc,key=lambda x:abs(float((x.get('details') or {}).get('strike_price'))-S)) if cc else None
+    if not put or not call: raise ValueError('NO_DATA: IV/Greeks insufficienti')
     piv=float(put['implied_volatility']); civ=float(call['implied_volatility']); aiv=atm_iv(rows,S) or (piv+civ)/2; dte=max((datetime.strptime(exp,'%Y-%m-%d').date()-date.today()).days,1); T=dte/365; down=piv*math.sqrt(T); up=civ*math.sqrt(T); b={'lower2':S*math.exp(-2*down),'lower1':S*math.exp(-down),'upper1':S*math.exp(up),'upper2':S*math.exp(2*up)}
     # Position vs previous saved box: meaningful for screener and oscillator.
     con=db(); con.row_factory=sqlite3.Row; prev=con.execute('SELECT * FROM band_history WHERE ticker=? AND day<? ORDER BY day DESC LIMIT 1',(t,date.today().isoformat())).fetchone(); pos=0.0
@@ -164,7 +179,7 @@ def zone(pos):
 def scan_worker(limit=0):
     try:
         uni=universe(limit); 
-        with LOCK: SCAN.update(total=len(uni),done=0,ok=0,errors=0,message='Scansione in corso')
+        with LOCK: SCAN.update(total=len(uni),done=0,ok=0,no_data=0,api_errors=0,errors=0,message='Scansione in corso')
         for i,x in enumerate(uni,1):
             t=x['ticker'];
             with LOCK: SCAN.update(ticker=t,done=i-1)
@@ -173,7 +188,13 @@ def scan_worker(limit=0):
                 if not e: raise RuntimeError('no expiry')
                 m=calc(t,e,True); b=m['bands']; z=zone(m['iv_position']); con=db(); con.execute('''INSERT OR REPLACE INTO scan_results(day,ticker,expiration,spot,put_iv,call_iv,skew,lower2,lower1,upper1,upper2,iv_position,zone,call_wall_below_score,call_wall_below_strike,call_wall_below_oi,put_wall_above_score,put_wall_above_strike,put_wall_above_oi,put_call_ratio,gex_estimate,call_wall_below_volume_score,call_wall_below_volume_strike,call_wall_below_volume,put_wall_above_volume_score,put_wall_above_volume_strike,put_wall_above_volume,put_call_ratio_volume,skew_left_score,skew_spot_position,skew_left_iv,skew_right_iv) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(date.today().isoformat(),t,e,m['spot'],m['put_iv'],m['call_iv'],m['skew'],b['lower2'],b['lower1'],b['upper1'],b['upper2'],m['iv_position'],z,m['call_wall_below_oi']['score'],m['call_wall_below_oi']['strike'],m['call_wall_below_oi']['oi'],m['put_wall_above_oi']['score'],m['put_wall_above_oi']['strike'],m['put_wall_above_oi']['oi'],m['put_call_ratio_oi'],m['gex_estimate'],m['call_wall_below_volume']['score'],m['call_wall_below_volume']['strike'],m['call_wall_below_volume']['volume'],m['put_wall_above_volume']['score'],m['put_wall_above_volume']['strike'],m['put_wall_above_volume']['volume'],m['put_call_ratio_volume'],m['skew_left_score'],m['skew_spot_position'],m['skew_left_iv'],m['skew_right_iv'])); con.commit(); con.close()
                 with LOCK: SCAN['ok']+=1
-            except Exception: 
+            except ValueError:
+                with LOCK: SCAN['no_data']+=1
+            except RuntimeError as e:
+                with LOCK:
+                    if 'API Massive' in str(e) or 'Endpoint' in str(e) or 'retry' in str(e): SCAN['api_errors']+=1
+                    else: SCAN['errors']+=1
+            except Exception:
                 with LOCK: SCAN['errors']+=1
             with LOCK: SCAN['done']=i
         with LOCK: SCAN.update(running=False,finished=datetime.utcnow().isoformat(),ticker='',message='Scansione completata')
@@ -223,5 +244,5 @@ def screener():
     else: q+=' ORDER BY iv_position ASC'
     r=con.execute(q,a).fetchall(); con.close(); return jsonify(results=[dict(x) for x in r])
 @app.get('/health')
-def health():return jsonify(ok=True,mode='v5.4-volatility-skew-scanner')
+def health():return jsonify(ok=True,mode='v5.4.1-scanner-fix')
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','5000')))
