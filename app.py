@@ -220,28 +220,37 @@ def scan_worker(limit=0):
 @app.get('/api/zero-dte/<ticker>')
 def zero_dte(ticker):
     try:
-        t=ticker.upper()
-        if t not in ('SPY','QQQ'): return jsonify(error='Solo SPY e QQQ sono disponibili in questa sezione.'),400
-        today=date.today().isoformat()
-        candles=api(f'/v2/aggs/ticker/{t}/range/5/minute/{today}/{today}',{'sort':'asc','limit':50000}).get('results',[])
-        if not candles: return jsonify(error='Nessuna candela 5m disponibile per oggi. Il piano Massive potrebbe non includere gli aggregati intraday azionari.'),503
-        spot=float(candles[-1]['c'])
-        rows=chain(t,today)
-        if not rows: return jsonify(error='Nessuna opzione 0DTE disponibile per oggi.'),404
-        iv=atm_iv(rows,spot)
-        if not iv: return jsonify(error='IV ATM 0DTE non disponibile: impossibile calcolare le bande.'),422
         from zoneinfo import ZoneInfo
+        t=ticker.upper()
+        if t not in ('SPX','NDX'): return jsonify(error='Solo gli indici SPX e NDX sono disponibili.'),400
         now=datetime.now(ZoneInfo('America/New_York'))
+        today=now.date().isoformat()
         expiry=now.replace(hour=16,minute=0,second=0,microsecond=0)
-        seconds=max(0,(expiry-now).total_seconds())
-        if seconds<=0: return jsonify(error='Scadenza 0DTE terminata: bande non più valide.'),422
+        seconds=(expiry-now).total_seconds()
+        if seconds<=0: return jsonify(error='La scadenza 0DTE delle 16:00 ET è terminata.'),422
+        # Massive usa identificatori I: per i prezzi degli indici.
+        price_symbol='I:'+t
+        candles=api(f'/v2/aggs/ticker/{price_symbol}/range/5/minute/{today}/{today}',{'sort':'asc','limit':50000}).get('results',[])
+        if not candles: return jsonify(error='Candele 5m dell’indice '+t+' non disponibili nel piano Massive attivo. Non sono stati usati prezzi ETF sostitutivi.'),503
+        spot=float(candles[-1]['c'])
+        # Le chain delle opzioni indice possono essere esposte con identificativi differenti.
+        rows=[]
+        for underlying in (price_symbol,t):
+            try:
+                rows=chain(underlying,today)
+                if rows: break
+            except RuntimeError as e:
+                if 'non incluso' not in str(e) and '403' not in str(e): raise
+        if not rows: return jsonify(error='Chain opzioni indice 0DTE '+t+' non disponibile con la chiave Massive attuale.'),404
+        iv=atm_iv(rows,spot)
+        if not iv: return jsonify(error='IV ATM 0DTE dell’indice non disponibile.'),422
         tau=seconds/(365*24*3600)
         sigma=iv*math.sqrt(tau)
         em=spot*sigma
         bands={'lower2':spot*math.exp(-2*sigma),'lower1':spot*math.exp(-sigma),'upper1':spot*math.exp(sigma),'upper2':spot*math.exp(2*sigma)}
-        curve,shape=volatility_skew(rows,spot)
+        curve,_=volatility_skew(rows,spot)
         metrics=chain_metrics(rows,spot)
-        return jsonify(ticker=t,proxy_for='ES' if t=='SPY' else 'NQ',date=today,spot=spot,candles=candles,iv_atm=iv,remaining_minutes=round(seconds/60,1),expected_move=em,expected_move_lower=spot-em,expected_move_upper=spot+em,bands=bands,volatility_skew_curve=curve,gamma_exposure_profile=metrics['gamma_profile'],gex_estimate=metrics['net_gex'],note='Livelli in prezzi ETF SPY/QQQ, NON in punti futures ES/NQ. GEX è un proxy; dati intraday soggetti al piano Massive.' )
+        return jsonify(ticker=t,date=today,spot=spot,candles=candles,iv_atm=iv,remaining_minutes=round(seconds/60,1),expected_move=em,expected_move_lower=spot-em,expected_move_upper=spot+em,bands=bands,volatility_skew_curve=curve,gamma_exposure_profile=metrics['gamma_profile'],gex_estimate=metrics['net_gex'],note='Prezzi e opzioni dell’indice '+t+'. GEX stimato con OI e convenzione call positiva/put negativa. Non sono dati futures.')
     except Exception as e: return jsonify(error=str(e)),500
 
 @app.route('/')
@@ -284,5 +293,5 @@ def screener():
     col=allowed.get(sort,'market_cap'); q+=f' ORDER BY COALESCE({col},0) {direction}'
     r=con.execute(q,a).fetchall(); con.close(); return jsonify(results=[dict(x) for x in r])
 @app.get('/health')
-def health():return jsonify(ok=True,mode='v5.5-marketcap-gex')
+def health():return jsonify(ok=True,mode='v5.7-index-0dte')
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','5000')))
