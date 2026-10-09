@@ -216,6 +216,34 @@ def scan_worker(limit=0):
     except Exception as e:
         with LOCK: SCAN.update(running=False,finished=datetime.utcnow().isoformat(),message=str(e))
 
+
+@app.get('/api/zero-dte/<ticker>')
+def zero_dte(ticker):
+    try:
+        t=ticker.upper()
+        if t not in ('SPY','QQQ'): return jsonify(error='Solo SPY e QQQ sono disponibili in questa sezione.'),400
+        today=date.today().isoformat()
+        candles=api(f'/v2/aggs/ticker/{t}/range/5/minute/{today}/{today}',{'sort':'asc','limit':50000}).get('results',[])
+        if not candles: return jsonify(error='Nessuna candela 5m disponibile per oggi. Il piano Massive potrebbe non includere gli aggregati intraday azionari.'),503
+        spot=float(candles[-1]['c'])
+        rows=chain(t,today)
+        if not rows: return jsonify(error='Nessuna opzione 0DTE disponibile per oggi.'),404
+        iv=atm_iv(rows,spot)
+        if not iv: return jsonify(error='IV ATM 0DTE non disponibile: impossibile calcolare le bande.'),422
+        from zoneinfo import ZoneInfo
+        now=datetime.now(ZoneInfo('America/New_York'))
+        expiry=now.replace(hour=16,minute=0,second=0,microsecond=0)
+        seconds=max(0,(expiry-now).total_seconds())
+        if seconds<=0: return jsonify(error='Scadenza 0DTE terminata: bande non più valide.'),422
+        tau=seconds/(365*24*3600)
+        sigma=iv*math.sqrt(tau)
+        em=spot*sigma
+        bands={'lower2':spot*math.exp(-2*sigma),'lower1':spot*math.exp(-sigma),'upper1':spot*math.exp(sigma),'upper2':spot*math.exp(2*sigma)}
+        curve,shape=volatility_skew(rows,spot)
+        metrics=chain_metrics(rows,spot)
+        return jsonify(ticker=t,proxy_for='ES' if t=='SPY' else 'NQ',date=today,spot=spot,candles=candles,iv_atm=iv,remaining_minutes=round(seconds/60,1),expected_move=em,expected_move_lower=spot-em,expected_move_upper=spot+em,bands=bands,volatility_skew_curve=curve,gamma_exposure_profile=metrics['gamma_profile'],gex_estimate=metrics['net_gex'],note='Livelli in prezzi ETF SPY/QQQ, NON in punti futures ES/NQ. GEX è un proxy; dati intraday soggetti al piano Massive.' )
+    except Exception as e: return jsonify(error=str(e)),500
+
 @app.route('/')
 def home(): return render_template('index.html')
 @app.get('/api/ticker/<t>')
