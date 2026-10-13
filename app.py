@@ -12,6 +12,8 @@ def db():
     cols={r[1] for r in con.execute('PRAGMA table_info(scan_results)').fetchall()}
     for name in ['call_wall_below_score','call_wall_below_strike','call_wall_below_oi','put_wall_above_score','put_wall_above_strike','put_wall_above_oi','put_call_ratio','gex_estimate','call_wall_below_volume_score','call_wall_below_volume_strike','call_wall_below_volume','put_wall_above_volume_score','put_wall_above_volume_strike','put_wall_above_volume','put_call_ratio_volume','skew_left_score','skew_spot_position','skew_left_iv','skew_right_iv','market_cap','call_negative_proxy','call_negative_strike','call_negative_oi']:
         if name not in cols: con.execute(f'ALTER TABLE scan_results ADD COLUMN {name} REAL')
+    con.execute('''CREATE TABLE IF NOT EXISTS scan_blocks(day TEXT NOT NULL, block INTEGER NOT NULL, ticker TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', PRIMARY KEY(day,block,ticker))''')
+    con.execute('CREATE INDEX IF NOT EXISTS idx_scan_blocks_day_block ON scan_blocks(day,block)')
     con.commit(); return con
 
 def cached(key,fn,ttl=CACHE_TTL):
@@ -207,7 +209,9 @@ def zone(pos):
 
 def scan_worker(limit=200,offset=0):
     try:
-        uni=universe()[offset:offset+limit]; 
+        uni=universe()[offset:offset+limit];
+        con=db(); day=date.today().isoformat(); block=offset//limit+1
+        con.executemany('INSERT OR IGNORE INTO scan_blocks(day,block,ticker,status) VALUES(?,?,?,?)',[(day,block,x['ticker'],'pending') for x in uni]); con.commit(); con.close() 
         with LOCK: SCAN.update(batch=offset//limit+1,batch_size=limit,total=len(uni),done=0,ok=0,no_data=0,api_errors=0,errors=0,message='Scansione in corso')
         for i,x in enumerate(uni,1):
             t=x['ticker'];
@@ -216,6 +220,7 @@ def scan_worker(limit=200,offset=0):
                 ex=expirations(t); e=target_exp(ex,30)
                 if not e: raise RuntimeError('no expiry')
                 m=calc(t,e,True); b=m['bands']; z=zone(m['iv_position']); con=db(); con.execute('''INSERT OR REPLACE INTO scan_results(day,ticker,expiration,spot,put_iv,call_iv,skew,lower2,lower1,upper1,upper2,iv_position,zone,call_wall_below_score,call_wall_below_strike,call_wall_below_oi,put_wall_above_score,put_wall_above_strike,put_wall_above_oi,put_call_ratio,gex_estimate,call_wall_below_volume_score,call_wall_below_volume_strike,call_wall_below_volume,put_wall_above_volume_score,put_wall_above_volume_strike,put_wall_above_volume,put_call_ratio_volume,skew_left_score,skew_spot_position,skew_left_iv,skew_right_iv,market_cap) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(date.today().isoformat(),t,e,m['spot'],m['put_iv'],m['call_iv'],m['skew'],b['lower2'],b['lower1'],b['upper1'],b['upper2'],m['iv_position'],z,m['call_wall_below_oi']['score'],m['call_wall_below_oi']['strike'],m['call_wall_below_oi']['oi'],m['put_wall_above_oi']['score'],m['put_wall_above_oi']['strike'],m['put_wall_above_oi']['oi'],m['put_call_ratio_oi'],m['gex_estimate'],m['call_wall_below_volume']['score'],m['call_wall_below_volume']['strike'],m['call_wall_below_volume']['volume'],m['put_wall_above_volume']['score'],m['put_wall_above_volume']['strike'],m['put_wall_above_volume']['volume'],m['put_call_ratio_volume'],m['skew_left_score'],m['skew_spot_position'],m['skew_left_iv'],m['skew_right_iv'],float(x.get('market_cap') or 0))); con.execute('UPDATE scan_results SET call_negative_proxy=?,call_negative_strike=?,call_negative_oi=? WHERE day=? AND ticker=?',(m['call_negative_scenario']['score'],m['call_negative_scenario']['strike'],m['call_negative_scenario']['oi'],date.today().isoformat(),t)); con.commit(); con.close()
+                con=db(); con.execute('UPDATE scan_blocks SET status=? WHERE day=? AND block=? AND ticker=?',('ok',day,block,t)); con.commit(); con.close()
                 with LOCK: SCAN['ok']+=1
             except ValueError:
                 with LOCK: SCAN['no_data']+=1
@@ -290,9 +295,19 @@ def scan_start():
 @app.get('/api/scan/status')
 def scan_status():
     with LOCK:return jsonify(dict(SCAN))
+@app.get('/api/scan/blocks')
+def scan_blocks():
+    con=db(); con.row_factory=sqlite3.Row
+    rows=con.execute('''SELECT block,COUNT(*) AS total,SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) AS valid FROM scan_blocks WHERE day=? GROUP BY block ORDER BY block''',(date.today().isoformat(),)).fetchall()
+    con.close(); return jsonify(blocks=[dict(r) for r in rows])
 @app.get('/api/screener')
 def screener():
-    z=request.args.get('zone','all'); metric=request.args.get('metric','volume'); con=db(); con.row_factory=sqlite3.Row; q='SELECT * FROM scan_results WHERE day=?'; a=[date.today().isoformat()]
+    z=request.args.get('zone','all'); metric=request.args.get('metric','volume'); con=db(); con.row_factory=sqlite3.Row; q='SELECT scan_results.* FROM scan_results WHERE scan_results.day=?'; a=[date.today().isoformat()]
+    block=request.args.get('block','all')
+    if block!='all':
+        try: block_num=int(block); assert block_num>0
+        except (ValueError,AssertionError): con.close(); return jsonify(error='Blocco non valido'),400
+        q+=' AND EXISTS (SELECT 1 FROM scan_blocks sb WHERE sb.day=scan_results.day AND sb.ticker=scan_results.ticker AND sb.block=? AND sb.status=?)'; a.extend([block_num,'ok'])
     if z=='minus2': q+=' AND iv_position<=-2'
     elif z=='minus1': q+=' AND iv_position<=-1'
     elif z=='plus1': q+=' AND iv_position>=1'
