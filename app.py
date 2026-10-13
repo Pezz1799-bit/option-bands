@@ -4,13 +4,13 @@ from flask import Flask, render_template, request, jsonify
 import requests
 
 app=Flask(__name__); BASE='https://api.massive.com'; API_KEY=os.getenv('MASSIVE_API_KEY','').strip(); DB_PATH=os.getenv('DB_PATH','/tmp/option_bands.db'); CACHE={}; CACHE_TTL=900
-SCAN={'running':False,'done':0,'total':0,'ok':0,'no_data':0,'api_errors':0,'errors':0,'ticker':'','started':None,'finished':None,'message':'Pronto'}; LOCK=threading.Lock()
+SCAN={'running':False,'done':0,'total':0,'ok':0,'no_data':0,'api_errors':0,'errors':0,'ticker':'','started':None,'finished':None,'message':'Pronto','batch':0,'batch_size':200}; LOCK=threading.Lock()
 
 def db():
     con=sqlite3.connect(DB_PATH,check_same_thread=False); con.execute('''CREATE TABLE IF NOT EXISTS band_history(day TEXT NOT NULL,ticker TEXT NOT NULL,expiration TEXT NOT NULL,spot REAL,put_iv REAL,atm_iv REAL,call_iv REAL,skew REAL,lower2 REAL,lower1 REAL,upper1 REAL,upper2 REAL,iv_position REAL,reference_spot REAL,current_spot REAL,put_delta REAL,call_delta REAL,put_strike REAL,call_strike REAL,PRIMARY KEY(day,ticker,expiration))'''); con.execute('''CREATE TABLE IF NOT EXISTS scan_results(day TEXT NOT NULL,ticker TEXT NOT NULL,expiration TEXT,spot REAL,put_iv REAL,call_iv REAL,skew REAL,lower2 REAL,lower1 REAL,upper1 REAL,upper2 REAL,iv_position REAL,zone TEXT,call_wall_below_score REAL,call_wall_below_strike REAL,call_wall_below_oi REAL,put_wall_above_score REAL,put_wall_above_strike REAL,put_wall_above_oi REAL,put_call_ratio REAL,gex_estimate REAL,skew_left_score REAL,skew_spot_position REAL,skew_left_iv REAL,skew_right_iv REAL,market_cap REAL,PRIMARY KEY(day,ticker))'''); 
     # Lightweight migration for databases created by previous versions.
     cols={r[1] for r in con.execute('PRAGMA table_info(scan_results)').fetchall()}
-    for name in ['call_wall_below_score','call_wall_below_strike','call_wall_below_oi','put_wall_above_score','put_wall_above_strike','put_wall_above_oi','put_call_ratio','gex_estimate','call_wall_below_volume_score','call_wall_below_volume_strike','call_wall_below_volume','put_wall_above_volume_score','put_wall_above_volume_strike','put_wall_above_volume','put_call_ratio_volume','skew_left_score','skew_spot_position','skew_left_iv','skew_right_iv','market_cap']:
+    for name in ['call_wall_below_score','call_wall_below_strike','call_wall_below_oi','put_wall_above_score','put_wall_above_strike','put_wall_above_oi','put_call_ratio','gex_estimate','call_wall_below_volume_score','call_wall_below_volume_strike','call_wall_below_volume','put_wall_above_volume_score','put_wall_above_volume_strike','put_wall_above_volume','put_call_ratio_volume','skew_left_score','skew_spot_position','skew_left_iv','skew_right_iv','market_cap','call_negative_proxy','call_negative_strike','call_negative_oi']:
         if name not in cols: con.execute(f'ALTER TABLE scan_results ADD COLUMN {name} REAL')
     con.commit(); return con
 
@@ -125,6 +125,20 @@ def chain_metrics(rows,S):
         else: put_gex+=gex
     return {'call_oi':call_oi,'put_oi':put_oi,'put_call_ratio_oi':(put_oi/call_oi) if call_oi>0 else None,'call_volume':call_volume,'put_volume':put_volume,'put_call_ratio_volume':(put_volume/call_volume) if call_volume>0 else None,'call_gex':call_gex,'put_gex':-put_gex,'net_gex':call_gex-put_gex,'gamma_profile':[gp[k] for k in sorted(gp)]}
 
+def call_negative_proxy(rows,S):
+    """Scenario only: dealer short listed calls above spot. OI cannot establish dealer sign."""
+    vals=[]
+    for x in rows:
+        d=x.get('details') or {}; g=x.get('greeks') or {}
+        if d.get('contract_type')!='call': continue
+        try:
+            k=float(d.get('strike_price') or 0); oi=float(x.get('open_interest') or 0); gamma=float(g.get('gamma') or 0)
+            if k>S and oi>0 and gamma>0: vals.append((gamma*oi*100*S*S*.01,k,oi))
+        except (ValueError,TypeError): pass
+    if not vals: return {'score':None,'strike':None,'oi':None}
+    v=max(vals)
+    return {'score':-sum(a for a,k,o in vals),'strike':v[1],'oi':v[2]}
+
 def volatility_skew(rows,S):
     # One IV point per strike: prefer OTM put below spot and OTM call above spot; near spot use available contract.
     by={}
@@ -163,7 +177,7 @@ def calc(t,exp,save=True):
     con=db(); con.row_factory=sqlite3.Row; prev=con.execute('SELECT * FROM band_history WHERE ticker=? AND day<? ORDER BY day DESC LIMIT 1',(t,date.today().isoformat())).fetchone(); pos=0.0
     if prev and prev['reference_spot'] and S>0:
         move=math.log(S/prev['reference_spot']); oldT=max((datetime.strptime(prev['expiration'],'%Y-%m-%d').date()-date.today()).days,1)/365; sig=(prev['call_iv'] if move>=0 else prev['put_iv'])*math.sqrt(oldT); pos=move/sig if sig>0 else 0
-    pd,pg=put['details'],put['greeks']; cd,cg=call['details'],call['greeks']; out={'expiration':exp,'dte':dte,'spot':S,'reference_spot':S,'put_iv':piv,'atm_iv':aiv,'call_iv':civ,'skew':piv-civ,'iv_position':pos,'bands':b,'put_strike':float(pd['strike_price']),'call_strike':float(cd['strike_price']),'put_delta':float(pg['delta']),'call_delta':float(cg['delta']),'mode':'Snapshot · 25Δ reali','option_profile_oi':oi_levels,'option_profile_volume':volume_levels,'call_wall_below_oi':call_wall_oi,'put_wall_above_oi':put_wall_oi,'call_wall_below_volume':call_wall_volume,'put_wall_above_volume':put_wall_volume,'put_call_ratio_oi':cm['put_call_ratio_oi'],'put_call_ratio_volume':cm['put_call_ratio_volume'],'call_oi_total':cm['call_oi'],'put_oi_total':cm['put_oi'],'call_volume_total':cm['call_volume'],'put_volume_total':cm['put_volume'],'gex_estimate':cm['net_gex'],'call_gex_estimate':cm['call_gex'],'put_gex_estimate':cm['put_gex'],'gamma_exposure_profile':cm['gamma_profile'],'volatility_skew_curve':skew_curve,'skew_left_score':skew_shape['score'],'skew_spot_position':skew_shape['spot_position'],'skew_left_iv':skew_shape['left_iv'],'skew_right_iv':skew_shape['right_iv'],'skew_left_qualifies':skew_shape['qualifies']}
+    pd,pg=put['details'],put['greeks']; cd,cg=call['details'],call['greeks']; out={'expiration':exp,'dte':dte,'spot':S,'reference_spot':S,'put_iv':piv,'atm_iv':aiv,'call_iv':civ,'skew':piv-civ,'iv_position':pos,'bands':b,'put_strike':float(pd['strike_price']),'call_strike':float(cd['strike_price']),'put_delta':float(pg['delta']),'call_delta':float(cg['delta']),'mode':'Snapshot · 25Δ reali','option_profile_oi':oi_levels,'option_profile_volume':volume_levels,'call_wall_below_oi':call_wall_oi,'put_wall_above_oi':put_wall_oi,'call_wall_below_volume':call_wall_volume,'put_wall_above_volume':put_wall_volume,'put_call_ratio_oi':cm['put_call_ratio_oi'],'put_call_ratio_volume':cm['put_call_ratio_volume'],'call_oi_total':cm['call_oi'],'put_oi_total':cm['put_oi'],'call_volume_total':cm['call_volume'],'put_volume_total':cm['put_volume'],'call_negative_scenario':call_negative_proxy(rows,S),'gex_estimate':cm['net_gex'],'call_gex_estimate':cm['call_gex'],'put_gex_estimate':cm['put_gex'],'gamma_exposure_profile':cm['gamma_profile'],'volatility_skew_curve':skew_curve,'skew_left_score':skew_shape['score'],'skew_spot_position':skew_shape['spot_position'],'skew_left_iv':skew_shape['left_iv'],'skew_right_iv':skew_shape['right_iv'],'skew_left_qualifies':skew_shape['qualifies']}
     if save:
         con.execute('''INSERT OR REPLACE INTO band_history(day,ticker,expiration,spot,put_iv,atm_iv,call_iv,skew,lower2,lower1,upper1,upper2,iv_position,reference_spot,current_spot,put_delta,call_delta,put_strike,call_strike) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(date.today().isoformat(),t,exp,S,piv,aiv,civ,piv-civ,b['lower2'],b['lower1'],b['upper1'],b['upper2'],pos,S,S,out['put_delta'],out['call_delta'],out['put_strike'],out['call_strike'])); con.commit()
     con.close(); return out
@@ -191,17 +205,17 @@ def zone(pos):
     if pos>=1:return '+1σ / +2σ'
     return 'Dentro ±1σ'
 
-def scan_worker(limit=0):
+def scan_worker(limit=200,offset=0):
     try:
-        uni=universe(limit); 
-        with LOCK: SCAN.update(total=len(uni),done=0,ok=0,no_data=0,api_errors=0,errors=0,message='Scansione in corso')
+        uni=universe()[offset:offset+limit]; 
+        with LOCK: SCAN.update(batch=offset//limit+1,batch_size=limit,total=len(uni),done=0,ok=0,no_data=0,api_errors=0,errors=0,message='Scansione in corso')
         for i,x in enumerate(uni,1):
             t=x['ticker'];
             with LOCK: SCAN.update(ticker=t,done=i-1)
             try:
                 ex=expirations(t); e=target_exp(ex,30)
                 if not e: raise RuntimeError('no expiry')
-                m=calc(t,e,True); b=m['bands']; z=zone(m['iv_position']); con=db(); con.execute('''INSERT OR REPLACE INTO scan_results(day,ticker,expiration,spot,put_iv,call_iv,skew,lower2,lower1,upper1,upper2,iv_position,zone,call_wall_below_score,call_wall_below_strike,call_wall_below_oi,put_wall_above_score,put_wall_above_strike,put_wall_above_oi,put_call_ratio,gex_estimate,call_wall_below_volume_score,call_wall_below_volume_strike,call_wall_below_volume,put_wall_above_volume_score,put_wall_above_volume_strike,put_wall_above_volume,put_call_ratio_volume,skew_left_score,skew_spot_position,skew_left_iv,skew_right_iv,market_cap) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(date.today().isoformat(),t,e,m['spot'],m['put_iv'],m['call_iv'],m['skew'],b['lower2'],b['lower1'],b['upper1'],b['upper2'],m['iv_position'],z,m['call_wall_below_oi']['score'],m['call_wall_below_oi']['strike'],m['call_wall_below_oi']['oi'],m['put_wall_above_oi']['score'],m['put_wall_above_oi']['strike'],m['put_wall_above_oi']['oi'],m['put_call_ratio_oi'],m['gex_estimate'],m['call_wall_below_volume']['score'],m['call_wall_below_volume']['strike'],m['call_wall_below_volume']['volume'],m['put_wall_above_volume']['score'],m['put_wall_above_volume']['strike'],m['put_wall_above_volume']['volume'],m['put_call_ratio_volume'],m['skew_left_score'],m['skew_spot_position'],m['skew_left_iv'],m['skew_right_iv'],float(x.get('market_cap') or 0))); con.commit(); con.close()
+                m=calc(t,e,True); b=m['bands']; z=zone(m['iv_position']); con=db(); con.execute('''INSERT OR REPLACE INTO scan_results(day,ticker,expiration,spot,put_iv,call_iv,skew,lower2,lower1,upper1,upper2,iv_position,zone,call_wall_below_score,call_wall_below_strike,call_wall_below_oi,put_wall_above_score,put_wall_above_strike,put_wall_above_oi,put_call_ratio,gex_estimate,call_wall_below_volume_score,call_wall_below_volume_strike,call_wall_below_volume,put_wall_above_volume_score,put_wall_above_volume_strike,put_wall_above_volume,put_call_ratio_volume,skew_left_score,skew_spot_position,skew_left_iv,skew_right_iv,market_cap) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(date.today().isoformat(),t,e,m['spot'],m['put_iv'],m['call_iv'],m['skew'],b['lower2'],b['lower1'],b['upper1'],b['upper2'],m['iv_position'],z,m['call_wall_below_oi']['score'],m['call_wall_below_oi']['strike'],m['call_wall_below_oi']['oi'],m['put_wall_above_oi']['score'],m['put_wall_above_oi']['strike'],m['put_wall_above_oi']['oi'],m['put_call_ratio_oi'],m['gex_estimate'],m['call_wall_below_volume']['score'],m['call_wall_below_volume']['strike'],m['call_wall_below_volume']['volume'],m['put_wall_above_volume']['score'],m['put_wall_above_volume']['strike'],m['put_wall_above_volume']['volume'],m['put_call_ratio_volume'],m['skew_left_score'],m['skew_spot_position'],m['skew_left_iv'],m['skew_right_iv'],float(x.get('market_cap') or 0))); con.execute('UPDATE scan_results SET call_negative_proxy=?,call_negative_strike=?,call_negative_oi=? WHERE day=? AND ticker=?',(m['call_negative_scenario']['score'],m['call_negative_scenario']['strike'],m['call_negative_scenario']['oi'],date.today().isoformat(),t)); con.commit(); con.close()
                 with LOCK: SCAN['ok']+=1
             except ValueError:
                 with LOCK: SCAN['no_data']+=1
@@ -272,7 +286,7 @@ def scan_start():
     with LOCK:
         if SCAN['running']: return jsonify(SCAN)
         SCAN.update(running=True,started=datetime.utcnow().isoformat(),finished=None,message='Preparazione universo…')
-    limit=max(0,int((request.get_json(silent=True) or {}).get('limit',0))); threading.Thread(target=scan_worker,args=(limit,),daemon=True).start(); return jsonify(SCAN)
+    payload=request.get_json(silent=True) or {}; offset=max(0,int(payload.get('offset',0))); threading.Thread(target=scan_worker,args=(200,offset),daemon=True).start(); return jsonify(SCAN)
 @app.get('/api/scan/status')
 def scan_status():
     with LOCK:return jsonify(dict(SCAN))
@@ -287,9 +301,12 @@ def screener():
     elif z=='putwall': q+=(' AND put_wall_above_volume_score>=70' if metric=='volume' else ' AND put_wall_above_score>=70')
     elif z=='walls': q+=( ' AND (call_wall_below_volume_score>=70 OR put_wall_above_volume_score>=70)' if metric=='volume' else ' AND (call_wall_below_score>=70 OR put_wall_above_score>=70)')
     elif z=='pcr1': q+=( ' AND put_call_ratio_volume>1' if metric=='volume' else ' AND put_call_ratio>1')
-    elif z=='leftskew': q+=' AND skew_left_iv>skew_right_iv AND skew_spot_position>0.5'
+    elif z=='negativecalls': q+=' AND call_negative_proxy<0'
+    elif z=='leftskew': q+=' AND skew_spot_position IS NOT NULL'
     sort=request.args.get('sort','market_cap'); direction='ASC' if request.args.get('dir','desc').lower()=='asc' else 'DESC'
-    allowed={'market_cap':'market_cap','ticker':'ticker','spot':'spot','iv_position':'iv_position','skew':'skew','pcr':'put_call_ratio_volume' if metric=='volume' else 'put_call_ratio','gex':'gex_estimate'}
+    allowed={'market_cap':'market_cap','ticker':'ticker','spot':'spot','iv_position':'iv_position','skew':'skew','pcr':'put_call_ratio_volume' if metric=='volume' else 'put_call_ratio','gex':'gex_estimate','skew_spot_position':'skew_spot_position','call_negative_proxy':'call_negative_proxy'}
+    if z=='leftskew' and sort=='market_cap': sort='skew_spot_position'; direction='DESC'
+    if z=='negativecalls' and sort=='market_cap': sort='call_negative_proxy'; direction='ASC'
     col=allowed.get(sort,'market_cap'); q+=f' ORDER BY COALESCE({col},0) {direction}'
     r=con.execute(q,a).fetchall(); con.close(); return jsonify(results=[dict(x) for x in r])
 @app.get('/health')
