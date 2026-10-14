@@ -20,3 +20,6 @@ Su Render free `/tmp` non è persistente. Per conservare mesi/anni di storico, i
 - Put Wall Above Score: cerca la concentrazione Put OI più anomala sopra il prezzo spot.
 - Score 0-100 normalizzato sulla distribuzione OI dello stesso lato/chain; filtro screener >=70.
 - Nuove colonne screener con score e strike dei due wall.
+
+
+V6.1: 15 blocchi selezionabili da 200 azioni (fino a 3.000). La selezione per scansione e quella per visualizzazione sono indipendenti.

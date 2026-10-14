@@ -291,7 +291,17 @@ def scan_start():
     with LOCK:
         if SCAN['running']: return jsonify(SCAN)
         SCAN.update(running=True,started=datetime.utcnow().isoformat(),finished=None,message='Preparazione universo…')
-    payload=request.get_json(silent=True) or {}; offset=max(0,int(payload.get('offset',0))); threading.Thread(target=scan_worker,args=(200,offset),daemon=True).start(); return jsonify(SCAN)
+    payload=request.get_json(silent=True) or {}
+    try:
+        block=int(payload.get('block',1))
+        if block<1 or block>15: raise ValueError()
+    except (TypeError,ValueError):
+        with LOCK: SCAN.update(running=False,message='Blocco non valido')
+        return jsonify(error='Seleziona un blocco tra 1 e 15'),400
+    offset=(block-1)*200
+    with LOCK: SCAN.update(batch=block,message=f'Preparazione blocco {block}…')
+    threading.Thread(target=scan_worker,args=(200,offset),daemon=True).start()
+    return jsonify(dict(SCAN))
 @app.get('/api/scan/status')
 def scan_status():
     with LOCK:return jsonify(dict(SCAN))
