@@ -1,25 +1,23 @@
-# Option Bands V4
+# Option Bands V6.2 — IV Term Structure
 
-- Massive Options Starter Option Chain Snapshot
-- Put/Call reali più vicine a 25 delta
-- Bande asimmetriche ±1σ / ±2σ
-- Motore di scansione Nasdaq + NYSE (azioni ordinarie / common stock)
-- Filtro screener ≤−2σ, ≤−1σ, ≥+1σ, ≥+2σ
-- Storico box salvati
-- Indicatore sotto il prezzo: posizione IV in sigma rispetto al box precedente
+Applicazione Flask con dati Massive. Avvio: `pip install -r requirements.txt`, configurare `MASSIVE_API_KEY`, poi `gunicorn app:app --timeout 180`. Per sviluppo: `python app.py`.
 
-## Nota importante sul market cap
-Il motore V4 scansiona le common stock Nasdaq/NYSE. Il filtro automatico market cap >= $1B richiede un dato fondamentale per ogni società; con Stocks Basic non è efficiente interrogare migliaia di Ticker Overview ad ogni scansione. Possiamo aggiungere una cache dell'universo market-cap o usare un piano/dataset stocks adatto al bulk screening.
+## Modifiche
+- Rimossa la sezione indici SPX/NDX 0DTE e il relativo endpoint.
+- IV Term Structure sotto il volatility skew: scadenze da 1 a 365 giorni, asse X in giorni di calendario, asse Y in IV annualizzata.
+- IV ATM: interpolazione lineare allo stesso prezzo di riferimento delle IV call e put, poi media delle due. Sono richiesti strike che comprendano lo spot, entro ±10%, su entrambi i lati; dati mancanti non vengono inventati.
+- Etichetta Contango / Backwardation / Piatta / Mista, sulla sequenza delle scadenze disponibili, con tolleranza di 0,1 punti percentuali IV tra punti consecutivi. Non è un segnale long/short. Le trimestrali possono creare gobbe.
+- Cursore a croce e valori al passaggio del mouse su skew, term structure e GEX; valori OHLC sul prezzo. I cursori sono indipendenti perché gli assi rappresentano date storiche, strike e scadenze diverse.
+- Preservati bande, storico, profili volume/OI e screener a 15 blocchi da 200 titoli, market cap ≥ $700M.
+- Paginazione completa delle scadenze e delle chain.
+
+## Dati e tempi
+La curva IV viene caricata separatamente, senza attendere tutte le scadenze per mostrare il prezzo. Fino a quattro richieste chain simultanee; il primo caricamento può richiedere tempo in funzione del piano e del rate limit Massive. Mostra copertura e scadenze non disponibili. Il prezzo di riferimento deriva dall'ultima candela giornaliera disponibile e la sua data è indicata sopra la curva: non è un feed tick sincronizzato. Cache chain fino a 5 minuti; scadenze fino a un'ora. Eventuali ritardi dipendono anche dal piano dati.
+
+GEX resta una stima gamma × OI con convenzione call positiva / put negativa, non una posizione dealer verificata.
 
 ## Persistenza
-Su Render free `/tmp` non è persistente. Per conservare mesi/anni di storico, impostare un database persistente (prossimo step consigliato).
+Impostare `DB_PATH` su un disco persistente per conservare lo storico e i risultati; il valore predefinito `/tmp/option_bands.db` è temporaneo.
 
-## V5 - Option Walls
-- Profilo Open Interest per strike sovrapposto al grafico: Call verdi, Put rosse.
-- Call Wall Below Score: cerca la concentrazione Call OI più anomala sotto il prezzo spot.
-- Put Wall Above Score: cerca la concentrazione Put OI più anomala sopra il prezzo spot.
-- Score 0-100 normalizzato sulla distribuzione OI dello stesso lato/chain; filtro screener >=70.
-- Nuove colonne screener con score e strike dei due wall.
-
-
-V6.1: 15 blocchi selezionabili da 200 azioni (fino a 3.000). La selezione per scansione e quella per visualizzazione sono indipendenti.
+## Verifiche eseguite
+Compilazione Python e sintassi JavaScript; test isolati di interpolazione ATM, IV non valide/mancanti, paginazione e classificazione delle curve. Nessuna verifica su dati Massive reali: chiave API non presente nell'ambiente di sviluppo.

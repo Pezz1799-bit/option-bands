@@ -45,7 +45,12 @@ def bars(t,days=365):
 def details(t): return cached(('det',t),lambda:api(f'/v3/reference/tickers/{t}').get('results',{}),3600)
 def expirations(t):
     def load():
-        j=api('/v3/reference/options/contracts',{'underlying_ticker':t,'expired':'false','limit':1000,'sort':'expiration_date','order':'asc'}); return sorted({x.get('expiration_date') for x in j.get('results',[]) if x.get('expiration_date')})
+        url='/v3/reference/options/contracts'; params={'underlying_ticker':t,'expired':'false','limit':1000,'sort':'expiration_date','order':'asc'}; found=set()
+        while url:
+            j=api(url,params); params=None
+            found.update(x['expiration_date'] for x in j.get('results',[]) if x.get('expiration_date'))
+            url=j.get('next_url')
+        return sorted(found)
     return cached(('exp',t),load,3600)
 def target_exp(exps,target=30):
     today=date.today(); valid=[]
@@ -59,7 +64,7 @@ def target_exp(exps,target=30):
 def chain(t,exp):
     def load():
         j=api(f'/v3/snapshot/options/{t}',{'expiration_date':exp,'limit':250,'sort':'strike_price','order':'asc'}); rows=list(j.get('results',[])); nxt=j.get('next_url'); n=1
-        while nxt and n<8: j=api(nxt); rows+=j.get('results',[]); nxt=j.get('next_url'); n+=1
+        while nxt: j=api(nxt); rows+=j.get('results',[]); nxt=j.get('next_url'); n+=1
         return rows
     return cached(('chain',t,exp),load,300)
 def valid(x):
@@ -236,42 +241,6 @@ def scan_worker(limit=200,offset=0):
         with LOCK: SCAN.update(running=False,finished=datetime.utcnow().isoformat(),message=str(e))
 
 
-@app.get('/api/zero-dte/<ticker>')
-def zero_dte(ticker):
-    try:
-        from zoneinfo import ZoneInfo
-        t=ticker.upper()
-        if t not in ('SPX','NDX'): return jsonify(error='Solo gli indici SPX e NDX sono disponibili.'),400
-        now=datetime.now(ZoneInfo('America/New_York'))
-        today=now.date().isoformat()
-        expiry=now.replace(hour=16,minute=0,second=0,microsecond=0)
-        seconds=(expiry-now).total_seconds()
-        if seconds<=0: return jsonify(error='La scadenza 0DTE delle 16:00 ET è terminata.'),422
-        # Massive usa identificatori I: per i prezzi degli indici.
-        price_symbol='I:'+t
-        candles=api(f'/v2/aggs/ticker/{price_symbol}/range/5/minute/{today}/{today}',{'sort':'asc','limit':50000}).get('results',[])
-        if not candles: return jsonify(error='Candele 5m dell’indice '+t+' non disponibili nel piano Massive attivo. Non sono stati usati prezzi ETF sostitutivi.'),503
-        spot=float(candles[-1]['c'])
-        # Le chain delle opzioni indice possono essere esposte con identificativi differenti.
-        rows=[]
-        for underlying in (price_symbol,t):
-            try:
-                rows=chain(underlying,today)
-                if rows: break
-            except RuntimeError as e:
-                if 'non incluso' not in str(e) and '403' not in str(e): raise
-        if not rows: return jsonify(error='Chain opzioni indice 0DTE '+t+' non disponibile con la chiave Massive attuale.'),404
-        iv=atm_iv(rows,spot)
-        if not iv: return jsonify(error='IV ATM 0DTE dell’indice non disponibile.'),422
-        tau=seconds/(365*24*3600)
-        sigma=iv*math.sqrt(tau)
-        em=spot*sigma
-        bands={'lower2':spot*math.exp(-2*sigma),'lower1':spot*math.exp(-sigma),'upper1':spot*math.exp(sigma),'upper2':spot*math.exp(2*sigma)}
-        curve,_=volatility_skew(rows,spot)
-        metrics=chain_metrics(rows,spot)
-        return jsonify(ticker=t,date=today,spot=spot,candles=candles,iv_atm=iv,remaining_minutes=round(seconds/60,1),expected_move=em,expected_move_lower=spot-em,expected_move_upper=spot+em,bands=bands,volatility_skew_curve=curve,gamma_exposure_profile=metrics['gamma_profile'],gex_estimate=metrics['net_gex'],note='Prezzi e opzioni dell’indice '+t+'. GEX stimato con OI e convenzione call positiva/put negativa. Non sono dati futures.')
-    except Exception as e: return jsonify(error=str(e)),500
-
 @app.route('/')
 def home(): return render_template('index.html')
 @app.get('/api/ticker/<t>')
@@ -283,6 +252,49 @@ def ticker(t):
 def options(t):
     try:return jsonify(calc(t.upper(),request.args.get('expiration'),True))
     except Exception as e:return jsonify(error=str(e)),500
+def term_atm(rows,spot):
+    """Interpolate each side at spot; no delta required. Reject distant strikes."""
+    result={}
+    for kind in ('call','put'):
+        by={}
+        for row in rows:
+            try:
+                d=row.get('details') or {}; k=float(d.get('strike_price',0)); iv=float(row.get('implied_volatility',0))
+                if d.get('contract_type')==kind and k>0 and math.isfinite(iv) and iv>0 and abs(k/spot-1)<=.10:
+                    by.setdefault(k,[]).append(iv)
+            except (ValueError,TypeError): continue
+        pts=sorted((k,sum(v)/len(v)) for k,v in by.items())
+        lower=[x for x in pts if x[0]<=spot]; upper=[x for x in pts if x[0]>=spot]
+        if not lower or not upper: continue
+        lo,hi=lower[-1],upper[0]
+        result[kind]=lo[1] if lo[0]==hi[0] else lo[1]+(hi[1]-lo[1])*(spot-lo[0])/(hi[0]-lo[0])
+    # Require both sides so every maturity uses the same definition.
+    if len(result)!=2: return None
+    return {'iv':(result['call']+result['put'])/2,'call_iv':result['call'],'put_iv':result['put']}
+
+@app.get('/api/iv-term-structure/<t>')
+def iv_term_structure(t):
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        t=t.upper(); today=date.today(); bs=bars(t,30)
+        if not bs or float(bs[-1]['c'])<=0: return jsonify(error='Prezzo non disponibile'),422
+        spot=float(bs[-1]['c']); dates=[e for e in expirations(t) if 0<(date.fromisoformat(e)-today).days<=365]
+        def point(e):
+            try:
+                value=term_atm(chain(t,e),spot)
+                if value is None: return {'expiration':e,'error':'IV ATM call/put insufficienti entro ±10% dallo spot'}
+                return dict(value,expiration=e,dte=(date.fromisoformat(e)-today).days)
+            except Exception:
+                return {'expiration':e,'error':'Chain non disponibile; controllare accesso e limiti del piano dati'}
+        with ThreadPoolExecutor(max_workers=4) as pool: results=list(pool.map(point,dates))
+        points=[x for x in results if 'iv' in x]; missing=[x for x in results if 'error' in x]
+        regime='Dati insufficienti'
+        if len(points)>=2:
+            diffs=[b['iv']-a['iv'] for a,b in zip(points,points[1:])]; tol=.001
+            regime='Piatta' if all(abs(x)<=tol for x in diffs) else ('Contango' if all(x>=-tol for x in diffs) else ('Backwardation' if all(x<=tol for x in diffs) else 'Mista / con gobbe'))
+        return jsonify(ticker=t,spot=spot,spot_date=datetime.fromtimestamp(bs[-1]['t']/1000).date().isoformat(),points=points,missing=missing,regime=regime,method='Media IV call/put interpolata allo spot; IV annualizzata; scadenze 1–365 giorni; tolleranza pendenza 0,1 punti IV. Snapshot in cache fino a 5 minuti.')
+    except Exception as e: return jsonify(error=str(e)),500
+
 @app.get('/api/history/<t>')
 def history(t):
     con=db(); con.row_factory=sqlite3.Row; r=con.execute('SELECT * FROM band_history WHERE ticker=? ORDER BY day ASC',(t.upper(),)).fetchall(); con.close(); return jsonify(results=[dict(x) for x in r])
@@ -335,5 +347,5 @@ def screener():
     col=allowed.get(sort,'market_cap'); q+=f' ORDER BY COALESCE({col},0) {direction}'
     r=con.execute(q,a).fetchall(); con.close(); return jsonify(results=[dict(x) for x in r])
 @app.get('/health')
-def health():return jsonify(ok=True,mode='v5.7-index-0dte')
+def health():return jsonify(ok=True,mode='v6.2-iv-term-structure')
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','5000')))
