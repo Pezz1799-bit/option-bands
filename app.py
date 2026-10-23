@@ -12,6 +12,8 @@ def db():
     cols={r[1] for r in con.execute('PRAGMA table_info(scan_results)').fetchall()}
     for name in ['call_wall_below_score','call_wall_below_strike','call_wall_below_oi','put_wall_above_score','put_wall_above_strike','put_wall_above_oi','put_call_ratio','gex_estimate','call_wall_below_volume_score','call_wall_below_volume_strike','call_wall_below_volume','put_wall_above_volume_score','put_wall_above_volume_strike','put_wall_above_volume','put_call_ratio_volume','skew_left_score','skew_spot_position','skew_left_iv','skew_right_iv','market_cap','call_negative_proxy','call_negative_strike','call_negative_oi']:
         if name not in cols: con.execute(f'ALTER TABLE scan_results ADD COLUMN {name} REAL')
+    for name,kind in [('iv_regime','TEXT'),('iv_valid_expiries','INTEGER'),('iv_missing_expiries','INTEGER'),('gamma_flip','REAL')]:
+        if name not in cols: con.execute(f'ALTER TABLE scan_results ADD COLUMN {name} {kind}')
     con.execute('''CREATE TABLE IF NOT EXISTS scan_blocks(day TEXT NOT NULL, block INTEGER NOT NULL, ticker TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', PRIMARY KEY(day,block,ticker))''')
     con.execute('CREATE INDEX IF NOT EXISTS idx_scan_blocks_day_block ON scan_blocks(day,block)')
     con.commit(); return con
@@ -256,6 +258,13 @@ def scan_worker(limit=200,offset=0):
                 ex=expirations(t); e=target_exp(ex,30)
                 if not e: raise RuntimeError('no expiry')
                 m=calc(t,e,True); b=m['bands']; z=zone(m['iv_position']); con=db(); con.execute('''INSERT OR REPLACE INTO scan_results(day,ticker,expiration,spot,put_iv,call_iv,skew,lower2,lower1,upper1,upper2,iv_position,zone,call_wall_below_score,call_wall_below_strike,call_wall_below_oi,put_wall_above_score,put_wall_above_strike,put_wall_above_oi,put_call_ratio,gex_estimate,call_wall_below_volume_score,call_wall_below_volume_strike,call_wall_below_volume,put_wall_above_volume_score,put_wall_above_volume_strike,put_wall_above_volume,put_call_ratio_volume,skew_left_score,skew_spot_position,skew_left_iv,skew_right_iv,market_cap) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(date.today().isoformat(),t,e,m['spot'],m['put_iv'],m['call_iv'],m['skew'],b['lower2'],b['lower1'],b['upper1'],b['upper2'],m['iv_position'],z,m['call_wall_below_oi']['score'],m['call_wall_below_oi']['strike'],m['call_wall_below_oi']['oi'],m['put_wall_above_oi']['score'],m['put_wall_above_oi']['strike'],m['put_wall_above_oi']['oi'],m['put_call_ratio_oi'],m['gex_estimate'],m['call_wall_below_volume']['score'],m['call_wall_below_volume']['strike'],m['call_wall_below_volume']['volume'],m['put_wall_above_volume']['score'],m['put_wall_above_volume']['strike'],m['put_wall_above_volume']['volume'],m['put_call_ratio_volume'],m['skew_left_score'],m['skew_spot_position'],m['skew_left_iv'],m['skew_right_iv'],float(x.get('market_cap') or 0))); con.execute('UPDATE scan_results SET call_negative_proxy=?,call_negative_strike=?,call_negative_oi=? WHERE day=? AND ticker=?',(m['call_negative_scenario']['score'],m['call_negative_scenario']['strike'],m['call_negative_scenario']['oi'],date.today().isoformat(),t)); con.commit(); con.close()
+                try:
+                    term=term_structure_data(t)
+                except Exception:
+                    term={'regime':'Dati insufficienti','points':[],'missing':[]}
+                curve=gex_price_curve(chain(t,e),m['spot'],m['dte'])
+                flips=curve.get('flips',[]); flip=min(flips,key=lambda f:abs(f-m['spot'])) if flips else None
+                con=db(); con.execute('UPDATE scan_results SET iv_regime=?,iv_valid_expiries=?,iv_missing_expiries=?,gamma_flip=? WHERE day=? AND ticker=?',(term['regime'],len(term['points']),len(term['missing']),flip,day,t)); con.commit(); con.close()
                 con=db(); con.execute('UPDATE scan_blocks SET status=? WHERE day=? AND block=? AND ticker=?',('ok',day,block,t)); con.commit(); con.close()
                 with LOCK: SCAN['ok']+=1
             except ValueError:
@@ -306,27 +315,29 @@ def term_atm(rows,spot):
     if len(result)!=2: return None
     return {'iv':(result['call']+result['put'])/2,'call_iv':result['call'],'put_iv':result['put']}
 
+def term_structure_data(t):
+    from concurrent.futures import ThreadPoolExecutor
+    t=t.upper(); today=date.today(); bs=bars(t,30)
+    if not bs or float(bs[-1]['c'])<=0: raise ValueError('Prezzo non disponibile')
+    spot=float(bs[-1]['c']); dates=[e for e in expirations(t) if 0<(date.fromisoformat(e)-today).days<=365]
+    def point(e):
+        try:
+            value=term_atm(chain(t,e),spot)
+            if value is None: return {'expiration':e,'error':'IV ATM call/put insufficienti entro ±10% dallo spot'}
+            return dict(value,expiration=e,dte=(date.fromisoformat(e)-today).days)
+        except Exception:
+            return {'expiration':e,'error':'Chain non disponibile; controllare accesso e limiti del piano dati'}
+    with ThreadPoolExecutor(max_workers=4) as pool: results=list(pool.map(point,dates))
+    points=[x for x in results if 'iv' in x]; missing=[x for x in results if 'error' in x]
+    regime='Dati insufficienti'
+    if len(points)>=2:
+        diffs=[b['iv']-a['iv'] for a,b in zip(points,points[1:])]; tol=.001
+        regime='Piatta' if all(abs(x)<=tol for x in diffs) else ('Contango' if all(x>=-tol for x in diffs) else ('Backwardation' if all(x<=tol for x in diffs) else 'Mista / con gobbe'))
+    return dict(ticker=t,spot=spot,spot_date=datetime.fromtimestamp(bs[-1]['t']/1000).date().isoformat(),points=points,missing=missing,regime=regime,method='Media IV call/put interpolata allo spot; IV annualizzata; scadenze 1–365 giorni; tolleranza pendenza 0,1 punti IV. Snapshot in cache fino a 5 minuti.')
+
 @app.get('/api/iv-term-structure/<t>')
 def iv_term_structure(t):
-    try:
-        from concurrent.futures import ThreadPoolExecutor
-        t=t.upper(); today=date.today(); bs=bars(t,30)
-        if not bs or float(bs[-1]['c'])<=0: return jsonify(error='Prezzo non disponibile'),422
-        spot=float(bs[-1]['c']); dates=[e for e in expirations(t) if 0<(date.fromisoformat(e)-today).days<=365]
-        def point(e):
-            try:
-                value=term_atm(chain(t,e),spot)
-                if value is None: return {'expiration':e,'error':'IV ATM call/put insufficienti entro ±10% dallo spot'}
-                return dict(value,expiration=e,dte=(date.fromisoformat(e)-today).days)
-            except Exception:
-                return {'expiration':e,'error':'Chain non disponibile; controllare accesso e limiti del piano dati'}
-        with ThreadPoolExecutor(max_workers=4) as pool: results=list(pool.map(point,dates))
-        points=[x for x in results if 'iv' in x]; missing=[x for x in results if 'error' in x]
-        regime='Dati insufficienti'
-        if len(points)>=2:
-            diffs=[b['iv']-a['iv'] for a,b in zip(points,points[1:])]; tol=.001
-            regime='Piatta' if all(abs(x)<=tol for x in diffs) else ('Contango' if all(x>=-tol for x in diffs) else ('Backwardation' if all(x<=tol for x in diffs) else 'Mista / con gobbe'))
-        return jsonify(ticker=t,spot=spot,spot_date=datetime.fromtimestamp(bs[-1]['t']/1000).date().isoformat(),points=points,missing=missing,regime=regime,method='Media IV call/put interpolata allo spot; IV annualizzata; scadenze 1–365 giorni; tolleranza pendenza 0,1 punti IV. Snapshot in cache fino a 5 minuti.')
+    try: return jsonify(term_structure_data(t))
     except Exception as e: return jsonify(error=str(e)),500
 
 @app.get('/api/history/<t>')
@@ -364,10 +375,10 @@ def screener():
         try: block_num=int(block); assert block_num>0
         except (ValueError,AssertionError): con.close(); return jsonify(error='Blocco non valido'),400
         q+=' AND EXISTS (SELECT 1 FROM scan_blocks sb WHERE sb.day=scan_results.day AND sb.ticker=scan_results.ticker AND sb.block=? AND sb.status=?)'; a.extend([block_num,'ok'])
-    if z=='minus2': q+=' AND iv_position<=-2'
-    elif z=='minus1': q+=' AND iv_position<=-1'
-    elif z=='plus1': q+=' AND iv_position>=1'
-    elif z=='plus2': q+=' AND iv_position>=2'
+    if z=='contango': q+=" AND iv_regime='Contango'"
+    elif z=='backwardation': q+=" AND iv_regime='Backwardation'"
+    elif z=='aboveflip': q+=' AND gamma_flip IS NOT NULL AND spot>gamma_flip'
+    elif z=='belowflip': q+=' AND gamma_flip IS NOT NULL AND spot<gamma_flip'
     elif z=='callwall': q+=(' AND call_wall_below_volume_score>=70' if metric=='volume' else ' AND call_wall_below_score>=70')
     elif z=='putwall': q+=(' AND put_wall_above_volume_score>=70' if metric=='volume' else ' AND put_wall_above_score>=70')
     elif z=='walls': q+=( ' AND (call_wall_below_volume_score>=70 OR put_wall_above_volume_score>=70)' if metric=='volume' else ' AND (call_wall_below_score>=70 OR put_wall_above_score>=70)')
@@ -381,5 +392,5 @@ def screener():
     col=allowed.get(sort,'market_cap'); q+=f' ORDER BY COALESCE({col},0) {direction}'
     r=con.execute(q,a).fetchall(); con.close(); return jsonify(results=[dict(x) for x in r])
 @app.get('/health')
-def health():return jsonify(ok=True,mode='v6.2-iv-term-structure')
+def health():return jsonify(ok=True,mode='v6.4-screeners')
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','5000')))
