@@ -168,6 +168,37 @@ def volatility_skew(rows,S):
     score=max(0.0,min(100.0,50.0+diff*1000.0)) if li is not None and ri is not None else 0.0
     return pts,{'score':score,'spot_position':spotpos,'left_iv':li,'right_iv':ri,'qualifies':bool(li is not None and ri is not None and li>ri and spotpos>0.5)}
 
+def gex_price_curve(rows,spot,dte,rate=.04,dividend=0.0):
+    """European Black-Scholes scenario, fixed IV/OI; call +, put - assumption."""
+    tau=max(dte,1)/365.0; contracts=[]; ivs=[]
+    for row in rows:
+        try:
+            d=row.get('details') or {}; k=float(d.get('strike_price',0)); iv=float(row.get('implied_volatility',0)); oi=option_oi(row); kind=d.get('contract_type'); mult=float(d.get('shares_per_contract') or 100)
+            if kind not in ('call','put') or not all(math.isfinite(x) and x>0 for x in (k,iv,oi,mult)): continue
+            contracts.append((k,iv,oi,mult,1 if kind=='call' else -1)); ivs.append((abs(k-spot),iv))
+        except (ValueError,TypeError): continue
+    if not contracts: return {'points':[],'flips':[],'contracts':0}
+    ref_iv=sum(v for _,v in sorted(ivs)[:6])/min(6,len(ivs)); span=min(.4,max(.1,2*ref_iv*math.sqrt(tau)))
+    def value(price):
+        total=0.0
+        for k,iv,oi,mult,sign in contracts:
+            d1=(math.log(price/k)+(rate-dividend+.5*iv*iv)*tau)/(iv*math.sqrt(tau))
+            gamma=math.exp(-dividend*tau-.5*d1*d1)/(math.sqrt(2*math.pi)*price*iv*math.sqrt(tau))
+            total+=sign*gamma*oi*mult*price*price*.01
+        return total
+    points=[{'price':spot*(1-span+2*span*i/200),'gex':value(spot*(1-span+2*span*i/200))} for i in range(201)]
+    flips=[]
+    for a,b in zip(points,points[1:]):
+        if a['gex']*b['gex']<0:
+            lo,hi=a['price'],b['price']; vlo=a['gex']
+            for _ in range(35):
+                mid=(lo+hi)/2; vm=value(mid)
+                if vm*vlo>0: lo=mid; vlo=vm
+                else: hi=mid
+            flips.append((lo+hi)/2)
+        elif a['gex']==0 and (not flips or abs(flips[-1]-a['price'])>spot*1e-8): flips.append(a['price'])
+    return {'points':points,'flips':flips,'spot_gex':value(spot),'contracts':len(contracts),'rate':rate,'dividend_yield':dividend,'dte':dte,'span_pct':span*100,'model':'Black-Scholes europeo; IV e OI fissi; call + / put −; moltiplicatore da contratto o 100. Scenario, non posizionamento dealer osservato.'}
+
 def calc(t,exp,save=True):
     bs=bars(t,30); S=float(bs[-1]['c']) if bs else 0
     if S<=0: raise RuntimeError('Prezzo non disponibile')
@@ -250,7 +281,10 @@ def ticker(t):
     except Exception as e:return jsonify(error=str(e)),500
 @app.get('/api/options/<t>')
 def options(t):
-    try:return jsonify(calc(t.upper(),request.args.get('expiration'),True))
+    try:
+        symbol=t.upper(); exp=request.args.get('expiration'); result=calc(symbol,exp,True)
+        result['gex_price_curve']=gex_price_curve(chain(symbol,exp),result['spot'],result['dte'])
+        return jsonify(result)
     except Exception as e:return jsonify(error=str(e)),500
 def term_atm(rows,spot):
     """Interpolate each side at spot; no delta required. Reject distant strikes."""

@@ -21,3 +21,7 @@ Impostare `DB_PATH` su un disco persistente per conservare lo storico e i risult
 
 ## Verifiche eseguite
 Compilazione Python e sintassi JavaScript; test isolati di interpolazione ATM, IV non valide/mancanti, paginazione e classificazione delle curve. Nessuna verifica su dati Massive reali: chiave API non presente nell'ambiente di sviluppo.
+
+## V6.3 — Curva GEX al variare del prezzo
+Il grafico GEX dispone delle viste Curva (predefinita), Barre e Curva + barre. In vista combinata la curva usa l'asse sinistro e le barre l'asse destro. La curva somma il gamma ricalcolato su 201 prezzi ipotetici, con Black-Scholes europeo, IV e OI fissi, call positive e put negative; non rappresenta il posizionamento osservato dei dealer. Usa solo la scadenza selezionata e i contratti con IV/OI disponibili. Gamma flip cercati nel solo range mostrato. Il modello usa tasso 4% e dividend yield 0%, esplicitati nell'interfaccia: sulle azioni con dividendi ed esercizio americano è un'approssimazione. Il gamma modellato allo spot può differire dal gamma dello snapshot delle barre. Il range è ±2 IV√T, limitato tra ±10% e ±40%. Il moltiplicatore viene letto da shares_per_contract o impostato a 100. Contratti rettificati con deliverable complesso possono richiedere trattamenti ulteriori. Nessun calcolo aggiuntivo durante le scansioni dei 15 blocchi.
+Verificati segno del gamma, proporzionalità all'OI, gamma flip e assenza dati; compilazione Python e sintassi JavaScript. Dati Massive reali e rendering completo in browser non verificati nell'ambiente di sviluppo.
