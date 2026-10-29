@@ -453,5 +453,5 @@ def screener():
     col=allowed.get(sort,'market_cap'); q+=f' ORDER BY COALESCE({col},0) {direction}'
     r=con.execute(q,a).fetchall(); con.close(); return jsonify(results=[dict(x) for x in r])
 @app.get('/health')
-def health():return jsonify(ok=True,mode='v6.6-three-smiles')
+def health():return jsonify(ok=True,mode='v6.7-price-smiles')
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','5000')))
