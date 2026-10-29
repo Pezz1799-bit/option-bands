@@ -44,3 +44,10 @@ Test isolati su database SQLite: migrazione ripetuta, quattro filtri, casi senza
 Verificati calcolo del minimo, minimo al bordo, assenza dati, persistenza nella funzione di calcolo, sovrascrittura giornaliera e separazione per scadenza. Python e JavaScript superano i controlli di sintassi. Nessuna prova con chiave Massive reale o verifica visiva completa in browser.
 
 Questa versione è stata applicata allo ZIP RODEQU-option-bands.zip. Flask utilizza templates/index.html; il file index.html nella radice resta quello originale.
+
+## V6.6 — Prime tre scadenze e smile composito
+Nuovo pannello indipendente dalla scadenza selezionata per bande/GEX: mostra le prime tre scadenze quotate non passate (inclusa oggi, se presente), con un colore per scadenza. Se una delle prime tre non ha almeno tre strike IV validi, mostra il problema senza sostituirla silenziosamente con una scadenza successiva.
+Il selettore consente uno smile composito: media aritmetica 1/3 delle IV annualizzate a parità di strike. Su griglie diverse interpola linearmente nel solo intervallo comune. Richiede tutte e tre le curve e almeno tre strike nel range comune. Questo è un indice di confronto, non la IV di un contratto o di una scadenza reale; non usa premi o OI come pesi.
+Minimi osservati indicati con un punto, linea orizzontale tratteggiata alla IV minima e linea verticale allo strike. Gli strike dei minimi sono anche livelli orizzontali tratteggiati sul grafico prezzo, separati dalla linea turchese storica. Se il minimo è al bordo viene indicato nel testo, senza presentarlo come vertice interno.
+Il caricamento del titolo salva anche le tre curve nel database per lo storico per singola scadenza. Il composito non viene salvato come se fosse una scadenza. Le rilevazioni conservano la data del prezzo di riferimento e si aggiornano al caricamento; non avviano acquisizioni automatiche a programma chiuso.
+Verificati media/interpolazione, limiti del range comune, selezione delle scadenze, IV mancanti, salvataggio per tre scadenze, sintassi e rendering SVG con DOM simulato (viste, tratteggi, livelli prezzo). Nessuna verifica con Massive reale o browser completo.

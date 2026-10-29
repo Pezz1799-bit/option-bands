@@ -353,6 +353,45 @@ def iv_term_structure(t):
     try: return jsonify(term_structure_data(t))
     except Exception as e: return jsonify(error=str(e)),500
 
+def combine_smiles(curves,spot):
+    # Equal-weight IV across exactly three maturities on overlapping strike ranges.
+    from bisect import bisect_left
+    if len(curves)!=3 or any(len(c)<3 for c in curves): return []
+    curves=[sorted(c,key=lambda p:p['strike']) for c in curves]
+    lo=max(c[0]['strike'] for c in curves); hi=min(c[-1]['strike'] for c in curves)
+    strikes=sorted({p['strike'] for c in curves for p in c if lo<=p['strike']<=hi})
+    if len(strikes)<3: return []
+    def iv_at(c,k):
+        keys=[p['strike'] for p in c]; i=bisect_left(keys,k)
+        if i<len(c) and c[i]['strike']==k: return c[i]['iv']
+        a,b=c[i-1],c[i]; return a['iv']+(b['iv']-a['iv'])*(k-a['strike'])/(b['strike']-a['strike'])
+    return [{'strike':k,'iv':sum(iv_at(c,k) for c in curves)/3,'type':'composito'} for k in strikes]
+
+@app.get('/api/first-smiles/<t>')
+def first_smiles(t):
+    try:
+        from zoneinfo import ZoneInfo
+        from concurrent.futures import ThreadPoolExecutor
+        t=t.upper(); now=datetime.now(ZoneInfo('America/New_York')); bs=bars(t,30)
+        if not bs or float(bs[-1]['c'])<=0: return jsonify(error='Prezzo non disponibile'),422
+        spot=float(bs[-1]['c']); dates=sorted({e for e in expirations(t) if date.fromisoformat(e)>=now.date()})[:3]
+        def one(e):
+            try:
+                curve,_=volatility_skew(chain(t,e),spot)
+                if len(curve)<3: return {'expiration':e,'error':'Meno di 3 strike con IV valida'}
+                return {'expiration':e,'curve':curve,'minimum':smile_minimum(curve,spot)}
+            except Exception: return {'expiration':e,'error':'Chain non disponibile per questa scadenza'}
+        with ThreadPoolExecutor(max_workers=3) as pool: results=list(pool.map(one,dates))
+        smiles=[x for x in results if 'curve' in x]; missing=[x for x in results if 'error' in x]
+        combined=combine_smiles([x['curve'] for x in smiles],spot)
+        spot_day=datetime.fromtimestamp(bs[-1]['t']/1000,ZoneInfo('America/New_York')).date().isoformat()
+        con=db()
+        for item in smiles:
+            m=item['minimum']; con.execute('INSERT OR REPLACE INTO smile_history(day,ticker,expiration,recorded_at,spot,spot_date,min_strike,min_iv,min_status,curve_json) VALUES(?,?,?,?,?,?,?,?,?,?)',(now.date().isoformat(),t,item['expiration'],now.isoformat(),spot,spot_day,m['strike'],m['iv'],m['status'],json.dumps(item['curve'],allow_nan=False)))
+        con.commit(); con.close()
+        return jsonify(ticker=t,spot=spot,spot_date=spot_day,requested_expirations=dates,smiles=smiles,missing=missing,composite={'curve':combined,'minimum':smile_minimum(combined,spot)},method='Media aritmetica IV 1/3 per scadenza, interpolata agli stessi strike solo nel range comune. Indice composito, non IV di una singola opzione.')
+    except Exception as e: return jsonify(error=str(e)),500
+
 @app.get('/api/smile-history/<t>')
 def smile_history(t):
     exp=request.args.get('expiration',''); con=db(); con.row_factory=sqlite3.Row
@@ -414,5 +453,5 @@ def screener():
     col=allowed.get(sort,'market_cap'); q+=f' ORDER BY COALESCE({col},0) {direction}'
     r=con.execute(q,a).fetchall(); con.close(); return jsonify(results=[dict(x) for x in r])
 @app.get('/health')
-def health():return jsonify(ok=True,mode='v6.5-smile-history')
+def health():return jsonify(ok=True,mode='v6.6-three-smiles')
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','5000')))
