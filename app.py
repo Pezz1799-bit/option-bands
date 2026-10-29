@@ -1,4 +1,4 @@
-import os, math, time, sqlite3, threading
+import os, math, time, sqlite3, threading, json
 from datetime import date, timedelta, datetime
 from flask import Flask, render_template, request, jsonify
 import requests
@@ -16,6 +16,7 @@ def db():
         if name not in cols: con.execute(f'ALTER TABLE scan_results ADD COLUMN {name} {kind}')
     con.execute('''CREATE TABLE IF NOT EXISTS scan_blocks(day TEXT NOT NULL, block INTEGER NOT NULL, ticker TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', PRIMARY KEY(day,block,ticker))''')
     con.execute('CREATE INDEX IF NOT EXISTS idx_scan_blocks_day_block ON scan_blocks(day,block)')
+    con.execute('''CREATE TABLE IF NOT EXISTS smile_history(day TEXT NOT NULL,ticker TEXT NOT NULL,expiration TEXT NOT NULL,recorded_at TEXT NOT NULL,spot REAL,spot_date TEXT,min_strike REAL,min_iv REAL,min_status TEXT,curve_json TEXT NOT NULL,PRIMARY KEY(day,ticker,expiration))''')
     con.commit(); return con
 
 def cached(key,fn,ttl=CACHE_TTL):
@@ -201,6 +202,13 @@ def gex_price_curve(rows,spot,dte,rate=.04,dividend=0.0):
         elif a['gex']==0 and (not flips or abs(flips[-1]-a['price'])>spot*1e-8): flips.append(a['price'])
     return {'points':points,'flips':flips,'spot_gex':value(spot),'contracts':len(contracts),'rate':rate,'dividend_yield':dividend,'dte':dte,'span_pct':span*100,'model':'Black-Scholes europeo; IV e OI fissi; call + / put −; moltiplicatore da contratto o 100. Scenario, non posizionamento dealer osservato.'}
 
+def smile_minimum(curve,spot):
+    pts=sorted([p for p in curve if math.isfinite(p['iv']) and p['iv']>0],key=lambda p:p['strike'])
+    if len(pts)<3: return {'strike':None,'iv':None,'status':'Dati insufficienti'}
+    lowest=min(p['iv'] for p in pts); tied=[p for p in pts if abs(p['iv']-lowest)<1e-10]
+    point=min(tied,key=lambda p:abs(p['strike']-spot)); interior=pts[0]['strike']<point['strike']<pts[-1]['strike']
+    return {'strike':point['strike'],'iv':point['iv'],'status':'Minimo osservato interno' if interior else 'Minimo al bordo: vertice non identificato'}
+
 def calc(t,exp,save=True):
     bs=bars(t,30); S=float(bs[-1]['c']) if bs else 0
     if S<=0: raise RuntimeError('Prezzo non disponibile')
@@ -218,7 +226,12 @@ def calc(t,exp,save=True):
     if prev and prev['reference_spot'] and S>0:
         move=math.log(S/prev['reference_spot']); oldT=max((datetime.strptime(prev['expiration'],'%Y-%m-%d').date()-date.today()).days,1)/365; sig=(prev['call_iv'] if move>=0 else prev['put_iv'])*math.sqrt(oldT); pos=move/sig if sig>0 else 0
     pd,pg=put['details'],put['greeks']; cd,cg=call['details'],call['greeks']; out={'expiration':exp,'dte':dte,'spot':S,'reference_spot':S,'put_iv':piv,'atm_iv':aiv,'call_iv':civ,'skew':piv-civ,'iv_position':pos,'bands':b,'put_strike':float(pd['strike_price']),'call_strike':float(cd['strike_price']),'put_delta':float(pg['delta']),'call_delta':float(cg['delta']),'mode':'Snapshot · 25Δ reali','option_profile_oi':oi_levels,'option_profile_volume':volume_levels,'call_wall_below_oi':call_wall_oi,'put_wall_above_oi':put_wall_oi,'call_wall_below_volume':call_wall_volume,'put_wall_above_volume':put_wall_volume,'put_call_ratio_oi':cm['put_call_ratio_oi'],'put_call_ratio_volume':cm['put_call_ratio_volume'],'call_oi_total':cm['call_oi'],'put_oi_total':cm['put_oi'],'call_volume_total':cm['call_volume'],'put_volume_total':cm['put_volume'],'call_negative_scenario':call_negative_proxy(rows,S),'gex_estimate':cm['net_gex'],'call_gex_estimate':cm['call_gex'],'put_gex_estimate':cm['put_gex'],'gamma_exposure_profile':cm['gamma_profile'],'volatility_skew_curve':skew_curve,'skew_left_score':skew_shape['score'],'skew_spot_position':skew_shape['spot_position'],'skew_left_iv':skew_shape['left_iv'],'skew_right_iv':skew_shape['right_iv'],'skew_left_qualifies':skew_shape['qualifies']}
+    minimum=smile_minimum(skew_curve,S); out['smile_minimum']=minimum
     if save:
+        from zoneinfo import ZoneInfo
+        observed=datetime.now(ZoneInfo('America/New_York')); observed_day=observed.date().isoformat()
+        spot_day=datetime.fromtimestamp(bs[-1]['t']/1000,ZoneInfo('America/New_York')).date().isoformat()
+        con.execute('''INSERT OR REPLACE INTO smile_history(day,ticker,expiration,recorded_at,spot,spot_date,min_strike,min_iv,min_status,curve_json) VALUES(?,?,?,?,?,?,?,?,?,?)''',(observed_day,t,exp,observed.isoformat(),S,spot_day,minimum['strike'],minimum['iv'],minimum['status'],json.dumps(skew_curve,allow_nan=False)))
         con.execute('''INSERT OR REPLACE INTO band_history(day,ticker,expiration,spot,put_iv,atm_iv,call_iv,skew,lower2,lower1,upper1,upper2,iv_position,reference_spot,current_spot,put_delta,call_delta,put_strike,call_strike) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(date.today().isoformat(),t,exp,S,piv,aiv,civ,piv-civ,b['lower2'],b['lower1'],b['upper1'],b['upper2'],pos,S,S,out['put_delta'],out['call_delta'],out['put_strike'],out['call_strike'])); con.commit()
     con.close(); return out
 
@@ -340,6 +353,15 @@ def iv_term_structure(t):
     try: return jsonify(term_structure_data(t))
     except Exception as e: return jsonify(error=str(e)),500
 
+@app.get('/api/smile-history/<t>')
+def smile_history(t):
+    exp=request.args.get('expiration',''); con=db(); con.row_factory=sqlite3.Row
+    rows=con.execute('SELECT * FROM smile_history WHERE ticker=? AND expiration=? ORDER BY day DESC LIMIT 365',(t.upper(),exp)).fetchall(); con.close()
+    results=[]
+    for row in reversed(rows):
+        item=dict(row); item['curve']=json.loads(item.pop('curve_json')); results.append(item)
+    return jsonify(results=results,expiration=exp)
+
 @app.get('/api/history/<t>')
 def history(t):
     con=db(); con.row_factory=sqlite3.Row; r=con.execute('SELECT * FROM band_history WHERE ticker=? ORDER BY day ASC',(t.upper(),)).fetchall(); con.close(); return jsonify(results=[dict(x) for x in r])
@@ -392,5 +414,5 @@ def screener():
     col=allowed.get(sort,'market_cap'); q+=f' ORDER BY COALESCE({col},0) {direction}'
     r=con.execute(q,a).fetchall(); con.close(); return jsonify(results=[dict(x) for x in r])
 @app.get('/health')
-def health():return jsonify(ok=True,mode='v6.4-screeners')
+def health():return jsonify(ok=True,mode='v6.5-smile-history')
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','5000')))

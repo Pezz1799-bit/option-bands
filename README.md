@@ -32,3 +32,15 @@ La scansione calcola la stessa curva IV del grafico (scadenze valide 1–365 gio
 Il gamma flip usa la scadenza scelta dallo screener, più vicina a 30 giorni; se ci sono più attraversamenti viene usato quello più vicino al prezzo di riferimento. Se manca un flip nel range simulato, o il prezzo coincide con esso, il titolo non entra nei filtri sopra/sotto. Sopra/sotto non equivale necessariamente a gamma positivo/negativo in presenza di più flip. Il prezzo di riferimento è l'ultima candela giornaliera disponibile.
 La migrazione del database è automatica e conserva lo storico. Ripetere i blocchi già scansionati per ottenere le nuove colonne. La scansione richiede più richieste API e tempo per elaborare le scadenze IV. Filtri e colonne seguono il blocco visualizzato.
 Test isolati su database SQLite: migrazione ripetuta, quattro filtri, casi senza flip e prezzo uguale al flip, opzioni del menu; sintassi Python e JavaScript. Nessun test con API Massive reali.
+
+
+## V6.5 — Evoluzione dello strike di minima IV
+- Linea turchese sul prezzo: strike con IV minima osservata nella smile della scadenza selezionata. Il pulsante Minimo smile la mostra/nasconde indipendentemente dalle bande.
+- Confronto delle ultime 5 smile salvate, con colori, minimi, cursore e data. Stessa scadenza per tutta la serie; nessuna concatenazione tra scadenze diverse.
+- Snapshot salvato caricando le opzioni o durante una scansione. Una riga al giorno di New York, per ticker/scadenza: l'ultima rilevazione sostituisce quella precedente dello stesso giorno. Non esiste un processo automatico di acquisizione a programma chiuso.
+- Dati aggiuntivi in una nuova tabella SQLite, senza modificare lo storico esistente. Impostare DB_PATH su disco persistente per non perdere le rilevazioni. Nessuno storico precedente viene inventato o ricostruito.
+- Il minimo usa i punti IV del provider, senza fit/smoothing o filtri di liquidità aggiuntivi. Se c'è parità sceglie lo strike più vicino al prezzo. Richiede almeno tre punti. Un minimo all'estremo del range è indicato come minimo al bordo e non compare come vertice nella linea storica. Una smile piatta o quotazioni poco liquide possono rendere poco significativo il minimo osservato: non è un target o un segnale di trading.
+- Data della rilevazione e data del prezzo di riferimento sono distinte: lo spot deriva dall'ultima candela giornaliera disponibile. La linea usa la data di osservazione della smile, non retrodata il dato alla candela dello spot.
+Verificati calcolo del minimo, minimo al bordo, assenza dati, persistenza nella funzione di calcolo, sovrascrittura giornaliera e separazione per scadenza. Python e JavaScript superano i controlli di sintassi. Nessuna prova con chiave Massive reale o verifica visiva completa in browser.
+
+Questa versione è stata applicata allo ZIP RODEQU-option-bands.zip. Flask utilizza templates/index.html; il file index.html nella radice resta quello originale.
