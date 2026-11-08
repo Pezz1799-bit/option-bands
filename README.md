@@ -1,4 +1,4 @@
-# Option Bands V6.2 — IV Term Structure
+# Option Bands V6.8 — GS Quant
 
 Applicazione Flask con dati Massive. Avvio: `pip install -r requirements.txt`, configurare `MASSIVE_API_KEY`, poi `gunicorn app:app --timeout 180`. Per sviluppo: `python app.py`.
 
@@ -57,3 +57,11 @@ Correzione della disposizione secondo il disegno di riferimento: le prime tre sm
 Le tre curve hanno colori differenti; minimo evidenziato con punto e tratteggio orizzontale fino all'asse del prezzo. Il composito è ancorato alla prima delle tre scadenze; non gli viene attribuita una scadenza propria. I minimi al bordo sono indicati nella legenda come tali.
 Spazio futuro creato tramite punti temporali vuoti e ancoraggi trasparenti per far rientrare gli strike nell'autoscala. Una volta caricato il titolo, la vista include le ultime circa 80 barre e le tre scadenze; è possibile modificare scala e intervallo normalmente. I disegni seguono zoom, trascinamento e ridimensionamento. Pulsante Curve sul prezzo ON/OFF. La linea storica resta indipendente.
 Verificati con DOM simulato: geometria strike/IV, posizionamento alle scadenze, tre curve/composito, tratteggi dei minimi, ON/OFF, scadenza coincidente con ultima candela. Non verificato il rendering completo con browser né dati Massive reali.
+
+## V6.8 — IV ATM e volatilità realizzata
+
+Con Python 3.10 o successivo, esegui `python -m pip install -r requirements.txt` nella cartella del programma. Avvia con `python app.py` e apri `http://localhost:5000`. La configurazione dati usa `MASSIVE_API_KEY`. GS Quant esegue il calcolo in locale, senza credenziali Goldman Sachs.
+
+Nel pannello **IV Term Structure**, la linea verde tratteggiata indica la volatilità realizzata annualizzata a 22 sedute (RV22). GS Quant calcola i 22 rendimenti semplici da 23 chiusure giornaliere Massive, rettificate per gli split. Il calcolo usa le barre già caricate per il grafico del prezzo. Una barra entra nel campione dal giorno successivo a New York. Il pannello riporta la data dell'ultima chiusura inclusa.
+
+L'IV di confronto è quella ATM della scadenza valida più vicina a 30 giorni di calendario, nell'intervallo 20–40 giorni. A parità di distanza viene scelta la scadenza più vicina nel tempo. Il pannello mostra scadenza, giorni residui e differenza annualizzata **IV ATM − RV22**, in punti percentuali. Se manca uno dei due dati, la differenza resta vuota. L'IV riflette i prezzi correnti delle opzioni, mentre la RV misura i movimenti osservati nello storico.

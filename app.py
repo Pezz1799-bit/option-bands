@@ -45,6 +45,40 @@ def bars(t,days=365):
         end=date.today(); start=end-timedelta(days=days); return api(f'/v2/aggs/ticker/{t}/range/1/day/{start}/{end}',{'adjusted':'true','sort':'asc','limit':5000}).get('results',[])
     return cached(('bars',t,days),load,900)
 
+def realized_volatility_22(price_bars):
+    """Return annualized GS Quant volatility as a fraction and its last session date."""
+    lookback = 22
+    if len(price_bars) <= lookback:
+        return None
+
+    import pandas as pd
+    from gs_quant.timeseries import Window, volatility
+
+    market_tz = 'America/New_York'
+    market_today = pd.Timestamp.now(tz=market_tz).date()
+    daily = pd.DataFrame(price_bars, columns=['t', 'c'])
+    daily['t'] = pd.to_numeric(daily['t'], errors='coerce')
+    timestamps = pd.to_datetime(daily['t'], unit='ms', utc=True, errors='coerce')
+    daily['session'] = timestamps.dt.tz_convert(market_tz).dt.tz_localize(None).dt.normalize()
+    sample = (daily.loc[daily['session'] < pd.Timestamp(market_today)]
+              .sort_values('t', kind='stable')
+              .drop_duplicates('session', keep='last')
+              .set_index('session')['c']
+              .tail(lookback + 1))
+    if len(sample) <= lookback:
+        return None
+    # GS Quant infers the annualization factor from the average spacing of observations.
+    if (sample.index[-1] - sample.index[0]).days / lookback >= 2.1:
+        return None
+    prices = pd.to_numeric(sample, errors='coerce')
+    if not all(math.isfinite(close) and close > 0 for close in prices):
+        return None
+
+    value = float(volatility(prices, Window(lookback, 0)).iloc[-1])
+    if not math.isfinite(value):
+        return None
+    return {'value': value / 100, 'as_of': prices.index[-1].date().isoformat()}
+
 def details(t): return cached(('det',t),lambda:api(f'/v3/reference/tickers/{t}').get('results',{}),3600)
 def expirations(t):
     def load():
@@ -299,8 +333,23 @@ def home(): return render_template('index.html')
 @app.get('/api/ticker/<t>')
 def ticker(t):
     try:
-        t=t.upper(); d=details(t); return jsonify(ticker=t,name=d.get('name',t),market_cap=d.get('market_cap'),exchange=d.get('primary_exchange'),bars=bars(t),expirations=expirations(t))
-    except Exception as e:return jsonify(error=str(e)),500
+        symbol = t.upper()
+        info = details(symbol)
+        price_bars = bars(symbol)
+        expiry_dates = expirations(symbol)
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+
+    try:
+        rv22 = realized_volatility_22(price_bars)
+        rv22_status = 'Storico giornaliero insufficiente o incompleto.' if rv22 is None else None
+    except Exception:
+        app.logger.exception('Calcolo GS Quant RV22 non riuscito per %s', symbol)
+        rv22 = None
+        rv22_status = 'Calcolo GS Quant non disponibile sul server.'
+    return jsonify(ticker=symbol, name=info.get('name', symbol), market_cap=info.get('market_cap'),
+                   exchange=info.get('primary_exchange'), bars=price_bars, expirations=expiry_dates,
+                   rv22=rv22, rv22_status=rv22_status)
 @app.get('/api/options/<t>')
 def options(t):
     try:
@@ -350,8 +399,16 @@ def term_structure_data(t):
 
 @app.get('/api/iv-term-structure/<t>')
 def iv_term_structure(t):
-    try: return jsonify(term_structure_data(t))
-    except Exception as e: return jsonify(error=str(e)),500
+    try:
+        result = term_structure_data(t)
+        result['near_30_day'] = min(
+            (point for point in result['points'] if 20 <= point['dte'] <= 40),
+            key=lambda point: (abs(point['dte'] - 30), point['dte']),
+            default=None,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify(error=str(e)), 500
 
 def combine_smiles(curves,spot):
     # Equal-weight IV across exactly three maturities on overlapping strike ranges.
